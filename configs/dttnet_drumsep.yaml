@@ -1,0 +1,88 @@
+audio:
+  chunk_size: 65408 #130048 #130560 #65280 #261120
+  dim_f: 512
+  dim_t: 512
+  hop_length: 128
+  n_fft: 1024
+  num_channels: 2
+  sample_rate: 44100
+  min_mean_abs: 0.000
+
+model:
+  model_type: dp_tdf
+  num_blocks: 5
+  l: 3
+  g: 64
+  k: 3
+  bn: 8
+  bias: false
+  bn_norm: BN
+  block_type: TFC_TDF_Res2
+  bandsequence:
+    rnn_type: LSTM
+    bidirectional: true
+    num_layers: 4
+    n_heads: 4
+
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  grad_clip: 2
+  instruments:
+  - kick
+  - snare
+  - toms
+  - hh
+  - cymbals
+  lr: 7.0e-05
+  patience: 50
+  reduce_factor: 0.95
+  target_instrument: kick
+  num_epochs: 1000
+  num_steps: 1000
+  q: 0.95
+  coarse_loss_clip: true
+  ema_momentum: 0.999
+  optimizer: adamw
+  other_fix: false
+  use_amp: true
+
+
+loss_multistft:
+  fft_sizes:
+  - 2048
+  - 4096
+  hop_sizes:
+  - 512
+  - 1024
+  win_lengths:
+  - 2048
+  - 4096
+  window: "hann_window"
+  # scale: "mel"
+  # n_bins: 128
+  sample_rate: 44100
+  perceptual_weighting: false
+  w_sc: 0.0
+  w_log_mag: 1.0
+  w_lin_mag: 0.0
+  w_phs: 0.0
+  mag_distance: "L1"
+
+augmentations:
+  enable: true
+  loudness: true
+  loudness_min: 0.75
+  loudness_max: 1.25
+  mixup: false
+  mixup_probs: !!python/tuple
+    - 0.2
+    - 0.02
+  mixup_loudness_min: 0.25
+  mixup_loudness_max: 1.25
+
+inference:
+  batch_size: 1
+  dim_t: 128
+  num_overlap: 2
+  extension: flac
