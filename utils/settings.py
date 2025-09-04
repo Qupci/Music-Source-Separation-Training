@@ -323,6 +323,9 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple[nn.Module,
     elif model_type =='mel_band_conformer':
         from models.mel_band_conformer import MelBandConformer
         model = MelBandConformer(**config.model)
+    elif model_type == 'dp_tdf':
+        from models.dp_tdf import DPTDFNet
+        model = DPTDFNet(**dict(config.model), **dict(config.audio))
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 

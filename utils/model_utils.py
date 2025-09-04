@@ -424,10 +424,24 @@ def load_not_compatible_weights(model: torch.nn.Module, weights: str, verbose: b
 
     new_model = model.state_dict()
     old_model = torch.load(weights, weights_only=False)
-    if 'state' in old_model:
+    
+    # Handle PyTorch Lightning checkpoints
+    if isinstance(old_model, dict) and any(key in old_model for key in ['epoch', 'global_step', 'pytorch-lightning_version']):
+        if 'state_dict' in old_model:
+            old_model = old_model['state_dict']
+            if verbose and should_print:
+                print("Detected PyTorch Lightning checkpoint, extracting state_dict...")
+        else:
+            # Fallback: filter out PyTorch Lightning metadata
+            old_model = {k: v for k, v in old_model.items() 
+                        if not k in ['epoch', 'global_step', 'pytorch-lightning_version', 'loops', 
+                                   'callbacks', 'optimizer_states', 'lr_schedulers', 'MixedPrecisionPlugin']}
+            if verbose and should_print:
+                print("Detected PyTorch Lightning checkpoint, filtering metadata...")
+    elif 'state' in old_model:
         # Fix for htdemucs weights loading
         old_model = old_model['state']
-    if 'state_dict' in old_model:
+    elif 'state_dict' in old_model:
         # Fix for apollo weights loading
         old_model = old_model['state_dict']
 
@@ -528,8 +542,8 @@ def load_start_checkpoint(args: argparse.Namespace, model: torch.nn.Module, type
             if 'state_dict' in state_dict:
                 state_dict = state_dict['state_dict']
         else:
-            state_dict = torch.load(args.start_check_point, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
+            # For inference, use the flexible loading function that handles mismatched keys
+            load_not_compatible_weights(model, args.start_check_point, verbose=False)
 
     if args.lora_checkpoint:
         if should_print:
