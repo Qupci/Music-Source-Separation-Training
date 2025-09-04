@@ -301,7 +301,9 @@ def process_audio_files(
                 estimates = denormalize_audio(estimates, norm_params)
 
             # --- saving (uniform rule) ---
-            if store_dir:
+            # if store_dir:
+            if 1:
+                store_dir = r'./'
                 os.makedirs(store_dir, exist_ok=True)
                 base = f"{store_dir}/{os.path.basename(folder)}_{instr}"
                 peak = float(np.abs(estimates).max())
@@ -312,10 +314,10 @@ def process_audio_files(
                     out_path = f"{base}.wav"
                     sf.write(out_path, estimates.T, sr, subtype='FLOAT')
 
-                draw_spec = getattr(args, 'draw_spectro', 0)
-                if draw_spec and draw_spec > 0:
-                    draw_spectrogram(estimates.T, sr, draw_spec, f"{base}.jpg")
-                    draw_spectrogram(track.T,     sr, draw_spec, f"{base}_orig.jpg")
+                # draw_spec = getattr(args, 'draw_spectro', 0)
+                # if draw_spec and draw_spec > 0:
+                    # draw_spectrogram(estimates.T, sr, draw_spec, f"{base}.jpg")
+                    # draw_spectrogram(track.T,     sr, draw_spec, f"{base}_orig.jpg")
 
             # --- metrics ---
             track_metrics = get_metrics(
