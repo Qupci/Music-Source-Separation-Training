@@ -26,8 +26,12 @@ warnings.filterwarnings("ignore")
 def run_folder(model, args, config, device, verbose=False):
     start_time = time.time()
     model.eval()
-    all_mixtures_path = glob.glob(args.input_folder + '/*.*')
-    all_mixtures_path.sort()
+    # Build list of files to process from either folder or single file
+    if getattr(args, 'input_file', None):
+        all_mixtures_path = [args.input_file]
+    else:
+        all_mixtures_path = glob.glob(args.input_folder + '/*.*')
+        all_mixtures_path.sort()
     sample_rate = 44100
     if 'sample_rate' in config.audio:
         sample_rate = config.audio['sample_rate']
@@ -133,6 +137,7 @@ def proc_folder(args):
     parser.add_argument("--config_path", type=str, help="path to config file")
     parser.add_argument("--start_check_point", type=str, default='', help="Initial checkpoint to valid weights")
     parser.add_argument("--input_folder", type=str, help="folder with mixtures to process")
+    parser.add_argument("--input_file", type=str, help="single mixture file to process")
     parser.add_argument("--store_dir", default="", type=str, help="path to store results as wav file")
     parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
     parser.add_argument("--extract_instrumental", action='store_true', help="invert vocals to get instrumental if provided")
@@ -145,6 +150,10 @@ def proc_folder(args):
         args = parser.parse_args()
     else:
         args = parser.parse_args(args)
+
+    # Require at least one of --input_folder or --input_file
+    if not getattr(args, 'input_folder', None) and not getattr(args, 'input_file', None):
+        parser.error('Please provide either --input_folder or --input_file')
 
     device = "cpu"
     if args.force_cpu:
