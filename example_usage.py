@@ -12,7 +12,7 @@ def main():
     parser.add_argument('--add_opt1', default=81, help='Additional option 1')
     parser.add_argument('--add_opt2', default=None, help='Additional option 2')
     parser.add_argument('--add_opt3', default=None, help='Additional option 3')
-    parser.add_argument('--poll', type=int, default=10, help='Poll interval (seconds)')
+    parser.add_argument('--poll', type=int, default=60, help='Poll interval (seconds)')
     parser.add_argument('--timeout', type=int, default=60*30, help='Timeout (seconds)')
     args = parser.parse_args()
 

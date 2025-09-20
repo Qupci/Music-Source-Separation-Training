@@ -8,6 +8,7 @@ import math
 import shutil
 import glob
 import yaml
+import re
 from urllib.parse import quote
 import numpy as np
 import soundfile as sf
@@ -33,7 +34,15 @@ def conf_edit(config_path, chunk_size, overlap):
         data = yaml.load(f, Loader=yaml.SafeLoader)
     if 'use_amp' not in data.keys():
         data['training']['use_amp'] = True
-    data['audio']['chunk_size'] = chunk_size
+    # ensure chunk_size is an int (users may supply strings from Colab widgets)
+    try:
+        cs = int(chunk_size)
+    except Exception:
+        try:
+            cs = int(float(chunk_size))
+        except Exception:
+            cs = chunk_size
+    data['audio']['chunk_size'] = cs
     data['inference']['num_overlap'] = overlap
     if data['inference']['batch_size'] == 1:
         data['inference']['batch_size'] = 2
@@ -95,6 +104,9 @@ variant_restore_side_maxfft_bs_highpass = True #@param {type:"boolean"}
 
 #@markdown ### Experimental:
 iterations_amount = 3 #@param {type:"slider", min:1, max:5, step:1}
+#@markdown ### Queue behavior:
+#@markdown If `dynamic_queue` is disabled the script will fully process each track through all iterations before moving to the next track.
+dynamic_queue = False #@param {type:"boolean"}
 
 ckpt_root = '/content/checkpoints'
 os.makedirs(ckpt_root, exist_ok=True)
@@ -161,10 +173,12 @@ def run_local_inference(model_key, input_file, store_dir):
            '--start_check_point', info['ckpt_path'],
            '--input_file', input_file,
            '--store_dir', store_dir]
-    subprocess.check_call(cmd)
+    # Use subprocess.run to capture stdout/stderr for better debugging
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return res
 
 
-def send_to_mvsep_async(token, input_file, output_dir, sep_type=40, add_opt1=81, poll=10, timeout=60 * 30, state=None):
+def send_to_mvsep_async(token, input_file, output_dir, sep_type=40, add_opt1=81, poll=10, timeout=60 * 30):
     os.makedirs(output_dir, exist_ok=True)
     try:
         try:
@@ -180,9 +194,9 @@ def send_to_mvsep_async(token, input_file, output_dir, sep_type=40, add_opt1=81,
                 subprocess.check_call(cmd)
             else:
                 raise FileNotFoundError('MVSep client not found; clone MVSep-API-Examples')
-    finally:
-        if state is not None:
-            state['done'] = True
+    except Exception as e:
+        # propagate exception for the future to capture
+        raise
 
 
 def read_wav_float(path):
@@ -233,9 +247,45 @@ def ensure_dirs(path):
 
 def find_model_output_for_file(store_dir, filename_stem, target_label='_other'):
     matches = []
+    # try the literal filename stem
     pattern = os.path.join(store_dir, '**', f"{filename_stem}*{target_label}*.wav")
     for p in glob.glob(pattern, recursive=True):
         matches.append(p)
+
+    # also try a slugified version (MVSep/slugify may rename files)
+    def slugify_string(s):
+        s = s.lower()
+        # replace non-alphanumeric with hyphen
+        s = re.sub(r"[^a-z0-9]+", '-', s)
+        # collapse multiple hyphens
+        s = re.sub(r'-{2,}', '-', s)
+        s = s.strip('-')
+        return s
+
+    slug = slugify_string(filename_stem)
+    if slug != filename_stem:
+        slug_pattern = os.path.join(store_dir, '**', f"{slug}*{target_label}*.wav")
+        for p in glob.glob(slug_pattern, recursive=True):
+            if p not in matches:
+                matches.append(p)
+
+    # If these are MVSep output folders, prefer files ending with '_other' and remove '_vocals' counterparts
+    lower_store = store_dir.replace('\\', '/').lower()
+    if 'mvsep_out' in lower_store or '/mvsep_' in lower_store or 'mvsep' in lower_store:
+        other_matches = [p for p in matches if '_other' in os.path.basename(p)]
+        if other_matches:
+            # remove any corresponding vocals files (same prefix, replace '_other' with '_vocals')
+            for other in other_matches:
+                b = os.path.basename(other)
+                vocals_name = b.replace('_other', '_vocals')
+                vocals_path = os.path.join(os.path.dirname(other), vocals_name)
+                try:
+                    if os.path.exists(vocals_path):
+                        os.remove(vocals_path)
+                except Exception:
+                    pass
+            return other_matches
+
     return matches
 
 
@@ -395,7 +445,8 @@ def build_variant_and_restore(basename, mask, finisher_iter_folder, variant_name
 
 
 def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_token):
-    basename = os.path.splitext(os.path.basename(input_path))[0]
+    raw_basename = os.path.splitext(os.path.basename(input_path))[0]
+    basename = strip_pass_prefixes(raw_basename)
     iterative_folder = os.path.join(ckpt_root, 'iterative', f'pass{iteration_target}_{mask}')
     ensure_dirs(iterative_folder)
     stores = {}
@@ -410,19 +461,51 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
         if k == 'mvsep':
             found = find_model_output_for_file(sd, basename, '_other')
             if len(found) == 0 and use_mvsep and mvsep_token:
-                if not mvsep_state.get('inflight', False):
-                    mvsep_state['inflight'] = True
-                    mvsep_state['done'] = False
-                    t = threading.Thread(target=send_to_mvsep_async, args=(mvsep_token, input_path, sd, 40, 81, 10, 60 * 30, mvsep_state))
-                    t.start()
+                # Use an executor stored in mvsep_state to submit a single MVSep future
+                executor = mvsep_state.get('executor')
+                future = mvsep_state.get('future')
+                if executor is None:
+                    # no executor available; fallback to threading submit
+                    if not mvsep_state.get('inflight', False):
+                        mvsep_state['inflight'] = True
+                        mvsep_state['done'] = False
+                        t = threading.Thread(target=send_to_mvsep_async, args=(mvsep_token, input_path, sd, 40, 81, 10, 60 * 30))
+                        t.start()
+                else:
+                    # if a previous future exists and is running, skip
+                    if future is None or future.done():
+                        mvsep_state['inflight'] = True
+                        mvsep_state['done'] = False
+                        fut = executor.submit(send_to_mvsep_async, mvsep_token, input_path, sd, 40, 81, 10, 60 * 30)
+                        mvsep_state['future'] = fut
+                    else:
+                        # already in flight
+                        pass
             continue
         found = find_model_output_for_file(sd, basename, '_other')
         if len(found) == 0:
             ensure_dirs(sd)
             try:
-                run_local_inference(k, input_path, sd)
-            except subprocess.CalledProcessError as e:
-                print('Local inference failed for', k, e)
+                res = run_local_inference(k, input_path, sd)
+                if res.returncode != 0:
+                    print(f"Local inference returned non-zero for {k}: returncode={res.returncode}")
+                    print('stdout:', res.stdout)
+                    print('stderr:', res.stderr)
+                else:
+                    # allow small time for files to be written
+                    time.sleep(0.5)
+            except Exception as e:
+                print('Exception while running local inference for', k, e)
+
+    # Ensure MVSEP outputs are present if MVSEP was requested and token provided.
+    if use_mvsep and mvsep_token:
+        mvsep_sd = stores.get('mvsep')
+        mvsep_found = []
+        if mvsep_sd:
+            mvsep_found = find_model_output_for_file(mvsep_sd, basename, '_other')
+        # If MVSEP was selected but no result yet, do not proceed to ensemble — wait
+        if len(mvsep_found) == 0:
+            return None
 
     model_results = []
     for k, sd in stores.items():
@@ -464,7 +547,11 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
     write_wav_float(diff_halved_path, diff_halved, sr)
 
     next_pass = src_cut - diff_halved
-    next_pass_path = os.path.join(iterative_folder, f'{basename}_pass{iteration_target+1}_{mask}.wav')
+    # write the next_pass file into the next iteration folder, with canonical basename
+    next_iter_folder = os.path.join(ckpt_root, 'iterative', f'pass{iteration_target+1}_{mask}')
+    ensure_dirs(next_iter_folder)
+    next_pass_filename = f'{basename}_pass{iteration_target+1}_{mask}.wav'
+    next_pass_path = os.path.join(next_iter_folder, next_pass_filename)
     write_wav_float(next_pass_path, next_pass, sr)
 
     if restore_side_iterative and iteration_target == 1:
@@ -473,6 +560,7 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
             R = src_w[1, :minlen]
             side = (L - R) * 0.5
             side_stereo = np.stack([side, side], axis=0)
+            # side artefacts for this iteration placed in the current iteration folder
             side_store = os.path.join(iterative_folder, 'side_res')
             ensure_dirs(side_store)
             try:
@@ -483,6 +571,36 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
                 pass
 
     return next_pass_path
+
+
+def any_expected_outputs_exist(iterative_folder, basename, iteration_target):
+    # check for ensemble, diff, halved diff, or model outputs for this iteration
+    patterns = [
+        os.path.join(iterative_folder, f"{basename}_pass{iteration_target}_max_fft.wav"),
+        os.path.join(iterative_folder, f"{basename}_pass{iteration_target}_max_fft_diff.wav"),
+        os.path.join(iterative_folder, f"{basename}_pass{iteration_target}_max_fft_diff_halved.wav"),
+    ]
+    for p in patterns:
+        if os.path.exists(p):
+            return True
+    # also check model output folders
+    for model_key in ['mel_v1e', 'bs_resurrect']:
+        folder = os.path.join(iterative_folder, model_key)
+        if os.path.exists(folder):
+            found = find_model_output_for_file(folder, basename, '_other')
+            if found:
+                return True
+    # check mvsep folder
+    mvsep_folder = os.path.join(iterative_folder, 'mvsep_out', '40_81')
+    if os.path.exists(mvsep_folder) and find_model_output_for_file(mvsep_folder, basename, '_other'):
+        return True
+    return False
+
+
+def strip_pass_prefixes(name):
+    # Remove any _passN or _passN_M sequences that may have been appended previously
+    # e.g. '05 - Breathe Deeper_pass2_14_pass3_14' -> '05 - Breathe Deeper'
+    return re.sub(r'(?:_pass\d+(?:_\d+)?)+', '', name)
 
 
 def main():
@@ -500,23 +618,62 @@ def main():
     print(f"Estimated total separations for this run: {per_song_sep_count * total_files}")
     print(f"Estimated MVSep separations for this run: {mvsep_selected * iterations_amount * total_files}")
 
-    mvsep_state = {'inflight': False, 'done': False}
+    import concurrent.futures
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    mvsep_state = {'inflight': False, 'done': False, 'executor': executor, 'future': None}
     mask = mask_from_flags(restore_side_iterative, use_mel_v1e, use_bs_resurrect, use_mvsep)
 
-    # Iterative passes (FIFO MVSep):
+    # Iterative passes: support dynamic (FIFO) or static per-track processing
     for idx, fpath in enumerate(files, 1):
         print(f"\nProcessing file {idx}/{total_files}: {fpath}")
         current_input = fpath
-        for it in range(1, iterations_amount + 1):
-            next_pass = process_single_song(current_input, mask, it, mvsep_state, mvsep_api_token)
-            if mvsep_state.get('inflight') and not mvsep_state.get('done'):
-                print('MVSep in progress for some file; continuing to next file while waiting')
-                break
-            if next_pass is None:
-                print('Could not create next pass yet, will check again later')
-                break
-            current_input = next_pass
+        if not dynamic_queue:
+            # Static: fully process this track through all iterations before moving on
+            for it in range(1, iterations_amount + 1):
+                next_pass = process_single_song(current_input, mask, it, mvsep_state, mvsep_api_token)
+                # Wait for next_pass file to appear (or for MVSep to finish) before continuing
+                wait_start = time.time()
+                timeout = 60 * 30
+                while True:
+                    if next_pass and os.path.exists(next_pass):
+                        current_input = next_pass
+                        break
+                    # maybe next_pass wasn't created yet, but model outputs exist
+                    cur_iter_folder = os.path.join(ckpt_root, 'iterative', f'pass{it}_{mask}')
+                    if any_expected_outputs_exist(cur_iter_folder, os.path.splitext(os.path.basename(fpath))[0], it):
+                        # allow next iteration to pick up generated files
+                        print('Detected model outputs for this iteration; continuing')
+                        break
+                    if mvsep_state.get('inflight'):
+                        print('Waiting for MVSep to complete for this track...')
+                        if mvsep_state.get('done'):
+                            # allow the loop to check for generated outputs again
+                            pass
+                    if time.time() - wait_start > timeout:
+                        print('Timeout waiting for next pass or MVSep; moving on')
+                        break
+                    time.sleep(3)
+        else:
+            # Dynamic FIFO behavior: process one iteration then continue to next file if MVSep inflight
+            for it in range(1, iterations_amount + 1):
+                next_pass = process_single_song(current_input, mask, it, mvsep_state, mvsep_api_token)
+                if mvsep_state.get('inflight') and not mvsep_state.get('done'):
+                    print('MVSep in progress for some file; continuing to next file while waiting')
+                    break
+                if next_pass is None:
+                    print('Could not create next pass yet, will check again later')
+                    break
+                current_input = next_pass
 
+    # Wait for any outstanding MVSep future to finish before finisher variants
+    fut = mvsep_state.get('future')
+    if fut is not None:
+        print('Waiting for outstanding MVSep job to finish before finisher stage...')
+        try:
+            fut.result(timeout=60 * 60)
+            print('MVSep job completed')
+        except Exception as e:
+            print('MVSep future ended with exception or timeout:', e)
     # Finisher variants
     finisher_root = os.path.join(ckpt_root, 'finisher', f'pass{iterations_amount}_{mask}')
     ensure_dirs(finisher_root)
