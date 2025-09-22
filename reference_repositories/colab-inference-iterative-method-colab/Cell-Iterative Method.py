@@ -74,41 +74,46 @@ def download_file(url):
 #@markdown ### Main settings:
 input_folder = '/content/drive/MyDrive/input' #@param {type:"string"}
 output_folder = '/content/drive/MyDrive/output' #@param {type:"string"}
-export_format = 'flac PCM_24' #@param ['wav FLOAT', 'flac PCM_16', 'flac PCM_24']
+export_format = 'wav FLOAT' #@param ['wav FLOAT', 'flac PCM_16', 'flac PCM_24']
 overlap = 2 #@param {type:"slider", min:2, max:40, step:1}
 chunk_size = "485100" #@param [88200, 112455, 132300, 156555, 176400, 352800, 485100, 529200, 588800, 587412, 661500, 749259] {allow-input: true}
 
 #@markdown ### MVSep API Token:
 mvsep_api_token = '' #@param {type:"string"}
+#@markdown ### MVSep no-credits handling:
+api_no_credits = True #@param {type:"boolean"}
 
 #@markdown ### Iterative stage:
+restore_side_iterative = True #@param {type:"boolean"}
+
 use_mel_v1e = True #@param {type:"boolean"}
 use_bs_resurrect = True #@param {type:"boolean"}
 use_mvsep = True #@param {type:"boolean"}
 
-restore_side_iterative = True #@param {type:"boolean"}
-
 #@markdown #### Checkpoints:
-enable_gdrive_checkpoints = True #@param {type:"boolean"}
+enable_gdrive_checkpoints = False #@param {type:"boolean"}
 gdrive_checkpoints_folder = '/content/drive/MyDrive/output/checkpoints' #@param {type:"string"}
 dont_move_checkpoints = False #@param {type:"boolean"}
 
 #@markdown ---
 #@markdown ### Finisher Variants:
+restore_side_variant = True #@param {type:"boolean"}
+
 variant_mvsep_only = True #@param {type:"boolean"}
-variant_restore_side_mvsep_only = True #@param {type:"boolean"}
-variant_restore_side_mvsep_plus_bs_res = True #@param {type:"boolean"}
-variant_restore_side_lowpass_plus_highpass = True #@param {type:"boolean"}
-variant_restore_side_maxfft_lowpass_highpass = True #@param {type:"boolean"}
-variant_restore_side_maxfft_bs_highpass = True #@param {type:"boolean"}
+variant_mvsep_plus_bs_res = False #@param {type:"boolean"}
+variant_lowpass_plus_highpass = False #@param {type:"boolean"}
+variant_maxfft_lowpass_highpass = False #@param {type:"boolean"}
+variant_maxfft_bs_highpass = False #@param {type:"boolean"}
 
 #@markdown ### Experimental:
 iterations_amount = 3 #@param {type:"slider", min:1, max:5, step:1}
+worker_count = 2 #@param {type:"slider", min:1, max:8, step:1}
 #@markdown ### Queue behavior:
 #@markdown If `dynamic_queue` is disabled the script will fully process each track through all iterations before moving to the next track.
-dynamic_queue = False #@param {type:"boolean"}
+dynamic_queue = True #@param {type:"boolean"}
 
-ckpt_root = '/content/checkpoints'
+ckpt_root = '/content/checkpoints' #@param {type:"string"}
+
 os.makedirs(ckpt_root, exist_ok=True)
 
 if export_format.startswith('flac'):
@@ -216,8 +221,67 @@ def write_wav_float(path, data, sr):
 
 
 def run_filter(infile, outfile, pass_type='hp', cutoff_hz=8000, poles=3, taps=513):
-    cmd = [sys.executable, 'scripts/linear_phase_filter.py', '--infile', infile, '--outfile', outfile, '--type', pass_type, '--freq', str(cutoff_hz), '--poles', str(poles), '--taps', str(taps)]
+    cmd = [sys.executable, 'scripts/linear_phase_filter.py',
+           '--infile', infile,
+           '--outfile', outfile,
+           '--type', pass_type,
+           '--freq', str(cutoff_hz),
+           '--poles', str(poles),
+           '--taps', str(taps)]
     subprocess.check_call(cmd)
+
+
+def file_duration_seconds(path):
+    try:
+        info = sf.info(path)
+        return float(info.frames) / float(info.samplerate)
+    except Exception:
+        return None
+
+
+def file_size_bytes(path):
+    try:
+        return os.path.getsize(path)
+    except Exception:
+        return None
+
+
+def convert_to_flac(src_path, dst_path, subtype='PCM_24'):
+    data, sr = sf.read(src_path, dtype='float32')
+    sf.write(dst_path, data, sr, format='FLAC', subtype=subtype)
+    return dst_path
+
+
+def prepare_mvsep_file(input_path, iterative_folder):
+    # returns a path ready to send to MVSep respecting api_no_credits rules
+    if not api_no_credits:
+        return input_path
+    dur = file_duration_seconds(input_path)
+    if dur is None:
+        # cannot determine length; be conservative and abort
+        raise RuntimeError('Could not determine input duration for MVSep size checks')
+    if dur > 60 * 10:
+        raise RuntimeError('MVSep api_no_credits: file longer than 10 minutes; aborting')
+
+    size = file_size_bytes(input_path) or 0
+    max_bytes = 100 * 1024 * 1024
+    if size <= max_bytes:
+        return input_path
+
+    # produce a FLAC file with the original basename (preserve any _pass... suffix) and .flac extension
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    send_path = os.path.join(iterative_folder, f"{base_name}.flac")
+    # try FLAC 24-bit (write to send_path)
+    convert_to_flac(input_path, send_path, subtype='PCM_24')
+    if file_size_bytes(send_path) <= max_bytes:
+        return send_path
+
+    # try FLAC 16-bit (overwrite send_path)
+    convert_to_flac(input_path, send_path, subtype='PCM_16')
+    if file_size_bytes(send_path) <= max_bytes:
+        return send_path
+
+    raise RuntimeError('MVSep api_no_credits: cannot reduce file under 100MB; aborting')
 
 
 def ms_encode(stereo):
@@ -301,18 +365,32 @@ def ensemble_files_to_file(file_list, out_path, algorithm='max_fft'):
 
 
 def restore_side_finisher(base_src_path, basename, temp_dir):
+    """
+    Finisher stage side restoration following the specified design:
+    - Creates finisher_left_side (L=L, R=L-R) and finisher_right_side (L=R, R=R-L)
+    - Separates both with BS-Roformer Resurrection
+    - Takes right channels, processes them through min_fft ensemble
+    - Returns the processed mono signal for M/S injection
+    """
     src, sr = read_wav_float(base_src_path)
     if src.shape[0] < 2:
         src = np.vstack([src[0], src[0]])
+    
     L = src[0]
     R = src[1]
-    fin_left = np.stack([L, (L - R)], axis=0)
-    fin_right = np.stack([R, (R - L)], axis=0)
+    
+    # Create finisher_left_side: L=L, R=L-R
+    fin_left = np.stack([L, L - R], axis=0)
+    
+    # Create finisher_right_side: L=R, R=R-L
+    fin_right = np.stack([R, R - L], axis=0)
+    
     fin_left_path = os.path.join(temp_dir, f'{basename}_finisher_left.wav')
     fin_right_path = os.path.join(temp_dir, f'{basename}_finisher_right.wav')
     write_wav_float(fin_left_path, fin_left, sr)
     write_wav_float(fin_right_path, fin_right, sr)
 
+    # Separate both files with BS-Roformer Resurrection
     side_store = os.path.join(temp_dir, 'finisher_side_bs')
     ensure_dirs(side_store)
     try:
@@ -325,27 +403,37 @@ def restore_side_finisher(base_src_path, basename, temp_dir):
     right_res = find_model_output_for_file(side_store, basename + '_finisher_right', '_other')
     if len(left_res) == 0 or len(right_res) == 0:
         raise FileNotFoundError('Finisher side separated files not found')
+    
     left_res_path = left_res[0]
     right_res_path = right_res[0]
 
     left_res_w, _ = read_wav_float(left_res_path)
     right_res_w, _ = read_wav_float(right_res_path)
+    
+    # Take right channel of finisher_left_side_res
     lr = left_res_w[1] if left_res_w.shape[0] > 1 else left_res_w[0]
+    
+    # Take right channel of finisher_right_side_res and phase invert it
     rr = right_res_w[1] if right_res_w.shape[0] > 1 else right_res_w[0]
     rr_inv = -rr
+    
+    # Create finisher_side_to_monomin
     comb = np.stack([lr, rr_inv], axis=0)
     comb_path = os.path.join(temp_dir, f'{basename}_finisher_side_to_monomin.wav')
     write_wav_float(comb_path, comb, sr)
 
+    # Apply min_fft ensemble
     mon_path = os.path.join(temp_dir, f'{basename}_finisher_side_to_monomin_min_fft.wav')
     ensemble_files_to_file([comb_path], mon_path, algorithm='min_fft')
 
+    # Apply highpass filter
     mon_hp_path = os.path.join(temp_dir, f'{basename}_finisher_side_to_monomin_min_fft_hp.wav')
     run_filter(mon_path, mon_hp_path, pass_type='hp', cutoff_hz=8000, poles=3)
 
     hp_w, _ = read_wav_float(mon_hp_path)
     if hp_w.ndim > 1 and hp_w.shape[0] > 1:
         hp_w = np.mean(hp_w, axis=0, keepdims=True)
+    
     return mon_hp_path, hp_w
 
 
@@ -418,22 +506,32 @@ def build_variant_and_restore(basename, mask, finisher_iter_folder, variant_name
         base_src = base_for_side
         if not base_src:
             raise FileNotFoundError('Base source for side restoration not found')
+        
+        # Get the processed mono highpass signal from restore_side_finisher
         mon_hp_path, hp_w = restore_side_finisher(base_src, basename, temp_dir)
 
+        # Encode the variant ensemble to M/S
         enc, sr = read_wav_float(ensemble_path)
         enc_ms = ms_encode(enc)
+        
+        # Replace the left channel (M) with finisher_side_to_monomin_min_fft_hp
         minlen = min(enc_ms.shape[1], hp_w.shape[1])
         enc_ms[0, :minlen] = hp_w[0, :minlen]
 
+        # Create variant_side_to_monomax
         enc_ms_path = os.path.join(temp_dir, f'{basename}_{variant_name}_ms_encoded.wav')
         write_wav_float(enc_ms_path, enc_ms, sr)
 
+        # Apply max_fft ensemble on variant_side_to_monomax
         side_to_monomax_path = os.path.join(temp_dir, f'{basename}_{variant_name}_side_to_monomax_max_fft.wav')
         ensemble_files_to_file([enc_ms_path], side_to_monomax_path, algorithm='max_fft')
 
+        # Replace the right channel (S) with variant_side_to_monomax_max_fft
         side_mono_w, _ = read_wav_float(side_to_monomax_path)
         minlen2 = min(enc_ms.shape[1], side_mono_w.shape[1])
         enc_ms[1, :minlen2] = side_mono_w[0, :minlen2]
+        
+        # Decode back to stereo
         restored = ms_decode(enc_ms)
         out_path = os.path.join(variant_output_path, f'{basename}_{variant_name}_restored.wav')
         write_wav_float(out_path, restored, sr)
@@ -449,40 +547,108 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
     basename = strip_pass_prefixes(raw_basename)
     iterative_folder = os.path.join(ckpt_root, 'iterative', f'pass{iteration_target}_{mask}')
     ensure_dirs(iterative_folder)
+    # Determine which models to run for this iteration.
+    # For intermediate iterations (1..iterations_amount-1) run the iterative models.
+    # For the final iteration (== iterations_amount) run only finisher-stage models
+    # depending on which finisher variants the user enabled.
     stores = {}
-    if use_mel_v1e:
-        stores['mel_v1e'] = os.path.join(iterative_folder, 'mel_v1e')
-    if use_bs_resurrect:
-        stores['bs_resurrect'] = os.path.join(iterative_folder, 'bs_resurrect')
-    if use_mvsep:
-        stores['mvsep'] = os.path.join(iterative_folder, 'mvsep_out', '40_81')
+    is_final = (iteration_target == iterations_amount)
+
+    # Finisher variant requirements
+    need_mvsep_final = any([
+        variant_mvsep_only,
+        variant_mvsep_plus_bs_res,
+        variant_lowpass_plus_highpass,
+        variant_maxfft_lowpass_highpass,
+        variant_maxfft_bs_highpass,
+    ])
+    need_bs_final = any([
+        variant_mvsep_plus_bs_res,
+        variant_lowpass_plus_highpass,
+        variant_maxfft_lowpass_highpass,
+        variant_maxfft_bs_highpass,
+    ])
+    need_melp_final = any([
+        variant_lowpass_plus_highpass,
+        variant_maxfft_lowpass_highpass,
+        variant_maxfft_bs_highpass,
+    ])
+
+    if not is_final:
+        if use_mel_v1e:
+            stores['mel_v1e'] = os.path.join(iterative_folder, 'mel_v1e')
+        if use_bs_resurrect:
+            stores['bs_resurrect'] = os.path.join(iterative_folder, 'bs_resurrect')
+        if use_mvsep:
+            stores['mvsep'] = os.path.join(iterative_folder, 'mvsep_out', '40_81')
+    else:
+        # Final/finisher pass: schedule only the models required by the enabled finisher variants.
+        # Do NOT consult the iterative-stage toggles (use_mvsep/use_bs_resurrect/use_mel_v1e).
+        if need_melp_final:
+            # finisher mel model
+            stores['mel_v1ep'] = os.path.join(iterative_folder, 'mel_v1ep')
+        # do not fallback to mel_v1e for finisher pass; if mel finisher isn't requested, skip mel entirely
+        if need_bs_final:
+            stores['bs_resurrect'] = os.path.join(iterative_folder, 'bs_resurrect')
+        if need_mvsep_final:
+            stores['mvsep'] = os.path.join(iterative_folder, 'mvsep_out', '40_81')
 
     for k, sd in stores.items():
         if k == 'mvsep':
-            found = find_model_output_for_file(sd, basename, '_other')
-            if len(found) == 0 and use_mvsep and mvsep_token:
+            found = find_model_output_for_file(sd, raw_basename, '_other')
+            # submit to MVSep if mvsep is scheduled for this pass and a token was provided
+            if len(found) == 0 and 'mvsep' in stores and mvsep_token:
                 # Use an executor stored in mvsep_state to submit a single MVSep future
                 executor = mvsep_state.get('executor')
                 future = mvsep_state.get('future')
                 if executor is None:
                     # no executor available; fallback to threading submit
                     if not mvsep_state.get('inflight', False):
+                        try:
+                            send_file = prepare_mvsep_file(input_path, iterative_folder)
+                        except Exception as e:
+                            print('MVSep prepare failed:', e)
+                            break
                         mvsep_state['inflight'] = True
                         mvsep_state['done'] = False
-                        t = threading.Thread(target=send_to_mvsep_async, args=(mvsep_token, input_path, sd, 40, 81, 10, 60 * 30))
+                        def _mvsep_thread():
+                            try:
+                                send_to_mvsep_async(mvsep_token, send_file, sd, 40, 81, 10, 60 * 30)
+                            finally:
+                                mvsep_state['inflight'] = False
+                                mvsep_state['done'] = True
+                        t = threading.Thread(target=_mvsep_thread)
                         t.start()
                 else:
                     # if a previous future exists and is running, skip
                     if future is None or future.done():
+                        try:
+                            send_file = prepare_mvsep_file(input_path, iterative_folder)
+                        except Exception as e:
+                            print('MVSep prepare failed:', e)
+                            break
                         mvsep_state['inflight'] = True
                         mvsep_state['done'] = False
-                        fut = executor.submit(send_to_mvsep_async, mvsep_token, input_path, sd, 40, 81, 10, 60 * 30)
+                        fut = executor.submit(send_to_mvsep_async, mvsep_token, send_file, sd, 40, 81, 10, 60 * 30)
                         mvsep_state['future'] = fut
+                        # ensure state updated when future completes
+                        def _on_done(fut_inner):
+                            try:
+                                fut_inner.result()
+                            except Exception:
+                                pass
+                            mvsep_state['inflight'] = False
+                            mvsep_state['done'] = True
+                        try:
+                            fut.add_done_callback(_on_done)
+                        except Exception:
+                            # add_done_callback may not be available on some futures; ignore
+                            pass
                     else:
                         # already in flight
                         pass
             continue
-        found = find_model_output_for_file(sd, basename, '_other')
+        found = find_model_output_for_file(sd, raw_basename, '_other')
         if len(found) == 0:
             ensure_dirs(sd)
             try:
@@ -497,13 +663,13 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
             except Exception as e:
                 print('Exception while running local inference for', k, e)
 
-    # Ensure MVSEP outputs are present if MVSEP was requested and token provided.
-    if use_mvsep and mvsep_token:
+    # Ensure MVSEP outputs are present if MVSEP was scheduled for this pass and token provided.
+    if 'mvsep' in stores and mvsep_token:
         mvsep_sd = stores.get('mvsep')
         mvsep_found = []
         if mvsep_sd:
             mvsep_found = find_model_output_for_file(mvsep_sd, basename, '_other')
-        # If MVSEP was selected but no result yet, do not proceed to ensemble — wait
+        # If MVSEP was scheduled but no result yet, do not proceed to ensemble — wait
         if len(mvsep_found) == 0:
             return None
 
@@ -547,30 +713,112 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
     write_wav_float(diff_halved_path, diff_halved, sr)
 
     next_pass = src_cut - diff_halved
-    # write the next_pass file into the next iteration folder, with canonical basename
-    next_iter_folder = os.path.join(ckpt_root, 'iterative', f'pass{iteration_target+1}_{mask}')
-    ensure_dirs(next_iter_folder)
-    next_pass_filename = f'{basename}_pass{iteration_target+1}_{mask}.wav'
-    next_pass_path = os.path.join(next_iter_folder, next_pass_filename)
-    write_wav_float(next_pass_path, next_pass, sr)
-
-    if restore_side_iterative and iteration_target == 1:
-        if src_w.shape[0] >= 2:
+    # If this is not the final iteration, write the next_pass file into the next iteration folder
+    if not is_final:
+        next_iter_folder = os.path.join(ckpt_root, 'iterative', f'pass{iteration_target+1}_{mask}')
+        ensure_dirs(next_iter_folder)
+        next_pass_filename = f'{basename}_pass{iteration_target+1}_{mask}.wav'
+        next_pass_path = os.path.join(next_iter_folder, next_pass_filename)
+        write_wav_float(next_pass_path, next_pass, sr)
+    else:
+        # For the final pass, do not create a next-pass file. Use the final ensemble file
+        # as the canonical target for any side-restoration injection and return it.
+        next_pass_path = None
+    # Side restoration (iterative): schedule side separation as a background job and
+    # wait for its completion before finalizing the next_pass file. If the side job
+    # is still running, return None so the dynamic queue can process other files.
+    if restore_side_iterative and src_w.shape[0] >= 2:
+        side_store = os.path.join(iterative_folder, 'side_res')
+        ensure_dirs(side_store)
+        side_path = os.path.join(iterative_folder, f'{basename}_pass{iteration_target}_side.wav')
+        try:
             L = src_w[0, :minlen]
             R = src_w[1, :minlen]
             side = (L - R) * 0.5
             side_stereo = np.stack([side, side], axis=0)
-            # side artefacts for this iteration placed in the current iteration folder
-            side_store = os.path.join(iterative_folder, 'side_res')
-            ensure_dirs(side_store)
+            write_wav_float(side_path, side_stereo, sr)
+        except Exception:
+            pass
+
+        # submit side separation to local_executor if not already submitted
+        side_key = f'{basename}_pass{iteration_target}'
+        side_futures = mvsep_state.get('side_futures', {})
+        if side_key not in side_futures:
             try:
-                side_path = os.path.join(iterative_folder, f'{basename}_pass1_side.wav')
-                write_wav_float(side_path, side_stereo, sr)
-                run_local_inference('bs_resurrect', side_path, side_store)
+                fut = mvsep_state['local_executor'].submit(run_local_inference, 'bs_resurrect', side_path, side_store)
+                side_futures[side_key] = fut
+                mvsep_state['side_futures'] = side_futures
             except Exception:
                 pass
 
-    return next_pass_path
+        # if the side future is not done yet, don't finalize this pass yet
+        fut = side_futures.get(side_key)
+        if fut is not None and not fut.done():
+            return None
+
+        # if side future completed, attempt to find the side-restored output and inject it
+        try:
+            side_base = f'{basename}_pass{iteration_target}_side'
+            side_found = find_model_output_for_file(side_store, side_base, '_other')
+            if side_found:
+                side_file = side_found[0]
+                side_w, _ = read_wav_float(side_file)
+                # Downmix bs_resurrect output to mono
+                if side_w.ndim > 1 and side_w.shape[0] > 1:
+                    bs_mono = np.mean(side_w, axis=0)
+                elif side_w.ndim == 1:
+                    bs_mono = side_w
+                else:
+                    bs_mono = side_w[0]
+
+                # Determine the target file to inject into: for intermediate passes use the
+                # generated next_pass; for the final pass use the ensemble pass_max_fft file.
+                target_inject_path = next_pass_path if next_pass_path is not None else pass_max_fft_path
+                np_next, _ = read_wav_float(target_inject_path)
+                enc_ms = ms_encode(np_next)
+                side_from_pass = enc_ms[1]
+
+                # Create two mono signals for ensemble: left==bs_res downmix, right==side from pass
+                minlen2 = min(bs_mono.shape[0], side_from_pass.shape[0])
+                a_bs = np.expand_dims(bs_mono[:minlen2], 0)
+                a_pass_side = np.expand_dims(side_from_pass[:minlen2], 0)
+
+                # Perform max-FFT ensemble on the two mono signals
+                try:
+                    ensembled = average_waveforms([a_bs, a_pass_side], [1.0, 1.0], 'max_fft')
+                except Exception:
+                    ensembled = a_bs
+
+                # Normalize ensemble shape to mono 1D
+                if ensembled.ndim > 1 and ensembled.shape[0] > 1:
+                    ensembled_mono = np.mean(ensembled, axis=0)
+                elif ensembled.ndim > 1:
+                    ensembled_mono = ensembled[0]
+                else:
+                    ensembled_mono = ensembled
+
+                # Inject the ensembled mono into the S channel of the target and decode back to stereo
+                enc_ms[1, :minlen2] = ensembled_mono[:minlen2]
+                restored = ms_decode(enc_ms)
+                write_wav_float(target_inject_path, restored, sr)
+                side_restored_path = os.path.join(iterative_folder, f'{basename}_pass{iteration_target}_side_restored.wav')
+                write_wav_float(side_restored_path, restored, sr)
+        except Exception:
+            pass
+
+    # If we created a next_pass (intermediate iteration), return its path.
+    if next_pass_path is not None:
+        return next_pass_path
+
+    # For final iteration we did not create a next-pass file; return the final
+    # ensemble file so callers (including the dynamic queue) can treat this
+    # iteration as completed and not re-enqueue indefinitely.
+    try:
+        if os.path.exists(pass_max_fft_path):
+            return pass_max_fft_path
+    except Exception:
+        pass
+    return None
 
 
 def any_expected_outputs_exist(iterative_folder, basename, iteration_target):
@@ -619,8 +867,11 @@ def main():
     print(f"Estimated MVSep separations for this run: {mvsep_selected * iterations_amount * total_files}")
 
     import concurrent.futures
+    # Use a small dedicated executor for remote MVSep submissions and a local executor
+    # for running local models (side separation). `worker_count` controls local workers.
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    mvsep_state = {'inflight': False, 'done': False, 'executor': executor, 'future': None}
+    local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+    mvsep_state = {'inflight': False, 'done': False, 'executor': executor, 'future': None, 'local_executor': local_executor, 'side_futures': {}}
     mask = mask_from_flags(restore_side_iterative, use_mel_v1e, use_bs_resurrect, use_mvsep)
 
     # Iterative passes: support dynamic (FIFO) or static per-track processing
@@ -654,16 +905,32 @@ def main():
                         break
                     time.sleep(3)
         else:
-            # Dynamic FIFO behavior: process one iteration then continue to next file if MVSep inflight
-            for it in range(1, iterations_amount + 1):
-                next_pass = process_single_song(current_input, mask, it, mvsep_state, mvsep_api_token)
-                if mvsep_state.get('inflight') and not mvsep_state.get('done'):
-                    print('MVSep in progress for some file; continuing to next file while waiting')
-                    break
+            # Dynamic FIFO behavior implemented as round-robin: process one iteration per file
+            # and re-enqueue until all files reach `iterations_amount`.
+            from collections import deque
+            queue = deque()
+            for f in files:
+                queue.append({'orig': f, 'current_input': f, 'pass': 1})
+
+            while queue:
+                item = queue.popleft()
+                f_orig = item['orig']
+                cur_input = item['current_input']
+                cur_pass = item['pass']
+                # print(f"\nDynamic: processing pass {cur_pass} for {f_orig}")
+                next_pass = process_single_song(cur_input, mask, cur_pass, mvsep_state, mvsep_api_token)
+
+                # If the pass couldn't be created yet (waiting for model outputs/MVSep), re-enqueue
                 if next_pass is None:
-                    print('Could not create next pass yet, will check again later')
-                    break
-                current_input = next_pass
+                    # avoid busy spin; sleep briefly before continuing with other files
+                    time.sleep(1)
+                    queue.append(item)
+                    continue
+
+                # Successfully created next_pass; enqueue next iteration if needed
+                if cur_pass < iterations_amount:
+                    queue.append({'orig': f_orig, 'current_input': next_pass, 'pass': cur_pass + 1})
+                # otherwise we've finished all passes for this file
 
     # Wait for any outstanding MVSep future to finish before finisher variants
     fut = mvsep_state.get('future')
@@ -680,24 +947,64 @@ def main():
     for idx, fpath in enumerate(files, 1):
         basename = os.path.splitext(os.path.basename(fpath))[0]
         print(f"\nFinisher: building variants for {basename}")
-        pass3_side = os.path.join(ckpt_root, 'iterative', f'pass{iterations_amount}_{mask}', f'{basename}_pass{iterations_amount}_side_restored.wav')
-        base_for_side = pass3_side if os.path.exists(pass3_side) else fpath
+        iter_passn_folder = os.path.join(ckpt_root, 'iterative', f'pass{iterations_amount}_{mask}')
+        # Wait for final-pass outputs to be present for this file before running finisher variants.
+        wait_start = time.time()
+        wait_timeout = 60 * 30
+        while not any_expected_outputs_exist(iter_passn_folder, basename, iterations_amount):
+            # if there's an outstanding mvsep job, wait; otherwise keep waiting until timeout
+            fut = mvsep_state.get('future')
+            if mvsep_state.get('inflight') and fut is not None:
+                print(f'Waiting for MVSep to complete for {basename} before finisher...')
+            if time.time() - wait_start > wait_timeout:
+                print(f'Waited {wait_timeout} seconds for pass{iterations_amount} outputs for {basename}; proceeding without finisher for this file')
+                break
+            time.sleep(3)
+        # Determine source for finisher-side restoration:
+        # - If `restore_side_finisher` is True and the final-pass side_restored exists, use it.
+        # - Otherwise, prefer a pass1 file if present (the initial processed file), else fall back to original source.
+        finisher_pass_file = os.path.join(iter_passn_folder, f'{basename}_pass{iterations_amount}_{mask}.wav')
+        pass1_folder = os.path.join(ckpt_root, 'iterative', f'pass1_{mask}')
+        pass1_file = os.path.join(pass1_folder, f'{basename}_pass1_{mask}.wav')
+        if restore_side_finisher and os.path.exists(finisher_pass_file):
+            base_for_side = finisher_pass_file
+        elif os.path.exists(pass1_file):
+            base_for_side = pass1_file
+        else:
+            # base_for_side = fpath
+            raise RuntimeError('Something went\'t wrong with picking a file to do finisher side restoration')
+        # Cleanup: if mvsep produced *_other.wav, remove corresponding *_vocals.wav to avoid confusion
+        mvsep_folder = os.path.join(iter_passn_folder, 'mvsep_out', '40_81')
+        try:
+            if os.path.exists(mvsep_folder):
+                other_pattern = os.path.join(mvsep_folder, '**', f"{basename}*__other*.wav")
+                # Also check non-double-underscore patterns
+                other_pattern2 = os.path.join(mvsep_folder, '**', f"{basename}*_other*.wav")
+                others = glob.glob(other_pattern, recursive=True) + glob.glob(other_pattern2, recursive=True)
+                for other in others:
+                    b = os.path.basename(other)
+                    vocals_name = b.replace('_other', '_vocals')
+                    vocals_path = os.path.join(os.path.dirname(other), vocals_name)
+                    if os.path.exists(vocals_path):
+                        try:
+                            os.remove(vocals_path)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         try:
             if variant_mvsep_only:
-                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_only', need_side_restore=False, base_for_side=base_for_side)
-                print('Created variant:', out)
-            if variant_restore_side_mvsep_only:
-                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_only', need_side_restore=True, base_for_side=base_for_side)
-                print('Created variant with restored side:', out)
-            if variant_restore_side_mvsep_plus_bs_res:
-                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_plus_bs_maxfft', need_side_restore=True, base_for_side=base_for_side)
-                print('Created variant with MVSEP+BS restored side:', out)
-            if variant_restore_side_lowpass_plus_highpass:
-                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_plus_bs_plus_melhp', need_side_restore=True, base_for_side=base_for_side)
-                print('Created variant (lowpass+highpass) restored side:', out)
-            if variant_restore_side_maxfft_lowpass_highpass:
-                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_bs_melhp_maxfft', need_side_restore=True, base_for_side=base_for_side)
-                print('Created variant (maxfft lowpass+highpass) restored side:', out)
+                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_only', need_side_restore=restore_side_variant, base_for_side=base_for_side)
+                print('Created variant with:', out)
+            if variant_mvsep_plus_bs_res:
+                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_plus_bs_maxfft', need_side_restore=restore_side_variant, base_for_side=base_for_side)
+                print('Created variant with MVSEP+BS:', out)
+            if variant_lowpass_plus_highpass:
+                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_plus_bs_plus_melhp', need_side_restore=restore_side_variant, base_for_side=base_for_side)
+                print('Created variant (lowpass+highpass):', out)
+            if variant_maxfft_lowpass_highpass:
+                out = build_variant_and_restore(basename, mask, finisher_root, 'mvsep_bs_melhp_maxfft', need_side_restore=restore_side_variant, base_for_side=base_for_side)
+                print('Created variant (maxfft lowpass+highpass):', out)
         except Exception as e:
             print('Error building finisher variants for', basename, e)
 
