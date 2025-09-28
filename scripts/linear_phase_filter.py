@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 from scipy import signal
@@ -65,6 +65,45 @@ def apply_filter(signal_in: np.ndarray, taps: np.ndarray) -> np.ndarray:
             chans.append(fftconvolve(signal_in[:, ch], taps, mode="same"))
         out = np.stack(chans, axis=1)
     return out
+
+
+def filter_signal(data: np.ndarray, fs: int, pass_type: str, freq: float, poles: int = 2, q: float = 1.0 / math.sqrt(2.0), taps_count: int = 513) -> np.ndarray:
+    """Apply the configured linear-phase filter to an in-memory audio array.
+
+    - `data`: shape (N,) or (N, C)
+    - `fs`: sample rate
+    - `pass_type`: one of 'lp','hp','blp','bhp'
+    - `freq`: cutoff frequency in Hz
+    - other args follow the CLI naming
+
+    Returns filtered array with same shape as input (float32).
+    """
+    # Ensure shape (N, C)
+    arr = data
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+
+    # Decide number of taps
+    taps = taps_count
+    if pass_type in ("blp", "bhp"):
+        taps = max(taps * 4, 2049)
+
+    # Design taps
+    if pass_type in ("blp", "bhp"):
+        base_type = "lp" if pass_type == "blp" else "hp"
+        taps_arr = design_linear_phase_fir(freq, fs, taps, base_type)
+    else:
+        taps_arr = approximate_iir_to_fir(freq, fs, poles, q, pass_type if pass_type in ("lp", "hp") else "lp", taps)
+
+    # Apply filter
+    if arr.shape[1] == 1:
+        out = apply_filter(arr[:, 0], taps_arr)
+        out = out.reshape(-1, 1)
+    else:
+        out = apply_filter(arr, taps_arr)
+
+    # Return as float32
+    return out.astype(np.float32)
 
 
 def stereo_safe_read_wav(path: str) -> tuple[int, np.ndarray]:
@@ -127,44 +166,42 @@ def approximate_iir_to_fir(cutoff_hz: float, fs: int, poles: int, q: float, pass
     return taps
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: Optional[list[str]] = None, *, data: Optional[np.ndarray] = None, fs: Optional[int] = None) -> Union[int, np.ndarray]:
+    """CLI entrypoint and programmatic API.
+
+    - CLI: call with `argv` (or let argparse use sys.argv) and no `data`/`fs`.
+    - In-memory: pass `data` and `fs`; `argv` may still provide `--type/--freq/...`.
+
+    Returns 0 for CLI success, or the filtered `np.ndarray` when called with `data`/`fs`.
+    """
     parser = argparse.ArgumentParser(description="Apply linear-phase highpass/lowpass filters to WAV files")
-    parser.add_argument("--infile", required=True, help="Input WAV path")
-    parser.add_argument("--outfile", required=True, help="Output WAV path")
+    parser.add_argument("--infile", help="Input WAV path")
+    parser.add_argument("--outfile", help="Output WAV path")
     parser.add_argument("--type", choices=["lp", "hp", "blp", "bhp"], default="lp", help="Filter type")
-    parser.add_argument("--freq", type=float, required=True, help="Cutoff frequency in Hz")
+    parser.add_argument("--freq", type=float, required=(data is None or fs is None), help="Cutoff frequency in Hz")
     parser.add_argument("--poles", type=int, default=2, help="Number of poles (2,4,6...). Default 2")
     parser.add_argument("--q", type=float, default=1.0 / math.sqrt(2.0), help="Quality factor Q (default 1/sqrt(2) )")
     parser.add_argument("--taps", type=int, default=513, help="Number of FIR taps (odd number recommended). Default 513")
     args = parser.parse_args(argv)
 
-    fs, data = stereo_safe_read_wav(args.infile)
+    # If data/fs not provided, use CLI infile
+    if data is None or fs is None:
+        if not args.infile:
+            parser.error("--infile is required when passing no data/fs")
+        fs, data = stereo_safe_read_wav(args.infile)
 
-    # Decide number of taps to use
-    taps_count = args.taps
-    if args.type in ("blp", "bhp"):
-        # Brickwall: increase taps for steeper transition
-        taps_count = max(taps_count * 4, 2049)
+    # Apply filter using in-memory API
+    filtered = filter_signal(data, fs, args.type, args.freq, poles=args.poles, q=args.q, taps_count=args.taps)
 
-    # Design taps
-    if args.type in ("blp", "bhp"):
-        # Use explicit windowed-sinc with many taps
-        base_type = "lp" if args.type == "blp" else "hp"
-        taps = design_linear_phase_fir(args.freq, fs, taps_count, base_type)
-    else:
-        taps = approximate_iir_to_fir(args.freq, fs, args.poles, args.q, args.type, taps_count)
+    # If CLI mode and outfile provided, write to disk and return 0
+    if (data is None or fs is None) or args.outfile:
+        if args.outfile:
+            stereo_safe_write_wav(args.outfile, fs, filtered)
+        # CLI invocation: return exit code
+        return 0
 
-    # Apply filter
-    # input data shape: (N, channels)
-    if data.shape[1] == 1:
-        sig = data[:, 0]
-        out = apply_filter(sig, taps)
-        final = out.reshape(-1, 1)
-    else:
-        final = apply_filter(data, taps)
-
-    stereo_safe_write_wav(args.outfile, fs, final)
-    return 0
+    # Programmatic invocation: return array
+    return filtered
 
 
 if __name__ == "__main__":
