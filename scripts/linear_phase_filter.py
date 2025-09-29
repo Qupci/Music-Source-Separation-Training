@@ -39,6 +39,12 @@ def design_linear_phase_fir(cutoff_hz: float, fs: int, numtaps: int, pass_type: 
     if not 0.0 < norm_cutoff < 1.0:
         raise ValueError("cutoff frequency must be within (0, fs/2)")
 
+    # Ensure odd number of taps for symmetric linear-phase FIRs (avoids SciPy firwin errors
+    # when using highpass/lowpass with even-length filters)
+    if numtaps % 2 == 0:
+        # bump to next odd value
+        numtaps += 1
+
     # Use firwin for linear-phase windowed-sinc FIR
     if pass_type in ("lp", "blp"):
         taps = signal.firwin(numtaps, norm_cutoff, window="hamming", pass_zero=True)
@@ -87,6 +93,11 @@ def filter_signal(data: np.ndarray, fs: int, pass_type: str, freq: float, poles:
     taps = taps_count
     if pass_type in ("blp", "bhp"):
         taps = max(taps * 4, 2049)
+
+    # Ensure an odd number of taps (firwin requires special handling for even-length
+    # filters, and even lengths can cause ValueError for highpass filters).
+    if taps % 2 == 0:
+        taps += 1
 
     # Design taps
     if pass_type in ("blp", "bhp"):

@@ -16,6 +16,7 @@ import soundfile as sf
 from ensemble import average_waveforms
 import scripts.linear_phase_filter as lpf
 from scripts.v1ep_resonance_remover.v1ep_resonance_remover import process_signal
+from scripts.skipy_slowdown_resample import prepare, restore  # 2x slowdown helpers
 
 class IndentDumper(yaml.Dumper):
     def increase_indent(self, flow=False, indentless=False):
@@ -95,10 +96,17 @@ use_mel_v1e = True #@param {type:"boolean"}
 use_bs_resurrect = True #@param {type:"boolean"}
 use_mvsep = False #@param {type:"boolean"}
 
+#@markdown #### 2x Slowdown (additional separations, not replacements):
+use_2x_slowdown_mel_v1e = True #@param {type:"boolean"}
+use_2x_slowdown_bs_resurrect = True #@param {type:"boolean"}
+use_2x_slowdown_mvsep = True #@param {type:"boolean"}
+
+#@markdown #### Amplify masked details
 # When enabled, create the final pass by amplifying the
 # masked (diff) details back to (approximately) their original amplitude
 # before injecting them back into a masked input. Only valid when
 # iterations_amount > 2 (otherwise the restoration would be invalid).
+#@markdown Can cause instrumental bleeding.
 amplify_masked_details = True #@param {type:"boolean"}
 
 #@markdown ---
@@ -178,21 +186,20 @@ def ensure_model_ckpts():
             pass
 
 
-# Number of bits used in the mask (amplify + side_restore + m1 + m2 + m3)
-MASK_BIT_COUNT = 5
+# Number of bits used in the mask (amplify + 2x_m1 + 2x_m2 + 2x_m3 + side_restore + m1 + m2 + m3)
+MASK_BIT_COUNT = 8
 AMPLIFY_BIT_MASK = 1 << (MASK_BIT_COUNT - 1)
 LOWER_BITS_MASK = AMPLIFY_BIT_MASK - 1
 
-def mask_from_flags(amplify, side_restore, m1, m2, m3):
+def mask_from_flags(amplify, d2_m1, d2_m2, d2_m3, side_restore, m1, m2, m3):
         """Encode flags into a bitmask.
 
         Bit order (most-significant -> least-significant):
-            amplify_masked_details, side_restore, m1, m2, m3
+            amplify_masked_details, 2x_m1, 2x_m2, 2x_m3, side_restore, m1, m2, m3
 
-        Note: the amplify bit is intentionally the highest-order bit so it can
-        be cleared easily for intermediate (non-finisher) passes.
+        Extends original 5-bit scheme with three new 2x slowdown bits.
         """
-        bits = [int(amplify), int(side_restore), int(m1), int(m2), int(m3)]
+        bits = [int(amplify), int(d2_m1), int(d2_m2), int(d2_m3), int(side_restore), int(m1), int(m2), int(m3)]
         s = ''.join(str(b) for b in bits)
         return int(s, 2)
 
@@ -271,7 +278,7 @@ def write_wav_float(path, data, sr):
     sf.write(path, data_out, sr, subtype='FLOAT')
 
 
-def run_filter(wave, sr, pass_type='hp', cutoff_hz=8000, poles=3, taps=513):
+def run_filter(wave, sr, pass_type, cutoff_hz, poles, taps):
     print(f'Running linear-phase filter...')
     # lpf.filter_signal expects shape (samples, channels) or 1D (samples,)
     arr = wave
@@ -448,6 +455,34 @@ def reconstruct_next_pass_from_prev(prev_folder, prev_iter, iteration_target, ba
             pf = os.path.join(prev_folder, mk)
             if os.path.exists(pf):
                 prev_model_files.extend(find_model_output_for_file(pf, basename, '_other'))
+
+        # Include 2x slowdown restored+filtered outputs if present from previous iteration
+        try:
+            eff_prev_mask = compute_effective_mask(mask, prev_iter)
+            stem_prev = f'{basename}_pass{prev_iter}_{eff_prev_mask}'
+            if use_2x_slowdown_bs_resurrect:
+                two_bs = os.path.join(prev_folder, '2x_bs_resurrect')
+                if os.path.exists(two_bs):
+                    cands = find_model_output_for_file(two_bs, stem_prev, '_other')
+                    for c in cands:
+                        if c not in prev_model_files:
+                            prev_model_files.append(c)
+            if use_2x_slowdown_mel_v1e:
+                two_mel = os.path.join(prev_folder, '2x_mel_v1e')
+                if os.path.exists(two_mel):
+                    cands = find_model_output_for_file(two_mel, stem_prev, '_other')
+                    for c in cands:
+                        if c not in prev_model_files:
+                            prev_model_files.append(c)
+            if use_2x_slowdown_mvsep:
+                two_mv = os.path.join(prev_folder, '2x_mvsep_out', '40_81')
+                if os.path.exists(two_mv):
+                    cands = find_model_output_for_file(two_mv, stem_prev, '_other')
+                    for c in cands:
+                        if c not in prev_model_files:
+                            prev_model_files.append(c)
+        except Exception:
+            pass
 
         if not prev_model_files:
             return None
@@ -995,6 +1030,82 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
         if len(found) > 0:
             model_results.append(found[0])
 
+    # Add 2x slowdown additional separations (iterative passes only)
+    if (iteration_target != iterations_amount) and (use_2x_slowdown_mel_v1e or use_2x_slowdown_bs_resurrect or use_2x_slowdown_mvsep):
+        CUTOFF_2X = 11025  # 0.5 rate virtual SR for 44.1kHz material
+        eff_mask = effective_mask  # already computed earlier
+        slowed_input_path = os.path.join(iterative_folder, f"{basename}_pass{iteration_target}_{eff_mask}_11025.wav")
+        # Prepare slowed input once
+        if not os.path.exists(slowed_input_path):
+            try:
+                slowed_arr, _srp = prepare(input_path, cutoff_freq=CUTOFF_2X)
+                write_wav_float(slowed_input_path, slowed_arr, 44100)
+            except Exception as e:
+                print('[2x] Failed preparing slowed input:', e)
+                slowed_input_path = None
+        if slowed_input_path and os.path.exists(slowed_input_path):
+            def _run_2x_local(model_key, folder_name):
+                try:
+                    tgt = os.path.join(iterative_folder, folder_name)
+                    ensure_dirs(tgt)
+                    res = run_local_inference(model_key, slowed_input_path, tgt)
+                    if res.returncode != 0:
+                        print(f'[2x] {model_key} inference returncode {res.returncode}')
+                        return None
+                    time.sleep(0.25)
+                    base_stem = f"{basename}_pass{iteration_target}_{eff_mask}_11025"
+                    outs = find_model_output_for_file(tgt, base_stem, '_other')
+                    if not outs:
+                        return None
+                    sep_path = outs[0]
+                    try:
+                        restored_arr, _ = restore(sep_path, cutoff_freq=CUTOFF_2X)
+                        try:
+                            filtered = run_filter(restored_arr, 44100, 'bhp', 2000, 3, 2049)
+                        except Exception:
+                            filtered = restored_arr
+                        filt_path = os.path.join(tgt, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
+                        write_wav_float(filt_path, filtered, 44100)
+                        return filt_path
+                    except Exception as e:
+                        print('[2x] restore/filter failed:', e)
+                        return None
+                except Exception as e:
+                    print('[2x] local run failed:', e)
+                    return None
+            if use_2x_slowdown_mel_v1e:
+                p = _run_2x_local('mel_v1e', '2x_mel_v1e')
+                if p:
+                    model_results.append(p)
+            if use_2x_slowdown_bs_resurrect:
+                p = _run_2x_local('bs_resurrect', '2x_bs_resurrect')
+                if p:
+                    model_results.append(p)
+            if use_2x_slowdown_mvsep and mvsep_token:
+                mv2_root = os.path.join(iterative_folder, '2x_mvsep_out')
+                ensure_dirs(mv2_root)
+                try:
+                    send_to_mvsep_async(mvsep_token, slowed_input_path, mv2_root, 40, 81, 10, 60*30)
+                    mv_sub = os.path.join(mv2_root, '40_81')
+                    time.sleep(0.25)
+                    base_stem = f"{basename}_pass{iteration_target}_{eff_mask}_11025"
+                    outs = find_model_output_for_file(mv_sub, base_stem, '_other')
+                    if outs:
+                        sep_path = outs[0]
+                        try:
+                            restored_arr, _ = restore(sep_path, cutoff_freq=CUTOFF_2X)
+                            try:
+                                filtered = run_filter(restored_arr, 44100, 'bhp', 2000, 3, 2049)
+                            except Exception:
+                                filtered = restored_arr
+                            filt_path = os.path.join(mv_sub, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
+                            write_wav_float(filt_path, filtered, 44100)
+                            model_results.append(filt_path)
+                        except Exception as e:
+                            print('[2x] mvsep restore/filter failed:', e)
+                except Exception as e:
+                    print('[2x] mvsep 2x submission failed:', e)
+
     if len(model_results) == 0:
         return None
 
@@ -1296,7 +1407,16 @@ def main():
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
     mvsep_state = {'inflight': False, 'done': False, 'executor': executor, 'future': None, 'local_executor': local_executor, 'side_futures': {}}
-    mask = mask_from_flags(amplify_masked_details, restore_side_iterative, use_mel_v1e, use_bs_resurrect, use_mvsep)
+    mask = mask_from_flags(
+        amplify_masked_details,
+        use_2x_slowdown_mel_v1e,
+        use_2x_slowdown_bs_resurrect,
+        use_2x_slowdown_mvsep,
+        restore_side_iterative,
+        use_mel_v1e,
+        use_bs_resurrect,
+        use_mvsep,
+    )
 
     # Iterative passes: support dynamic (FIFO) or static per-track processing
     # Precompute resume info once per input file to avoid redundant filesystem scans
