@@ -60,7 +60,15 @@ def _write_audio(dst: str, data: np.ndarray, sr: int) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(dst)) or '.', exist_ok=True)
     # Guarantee 32-bit float output
     data32 = _to_float32(data)
-    sf.write(dst, data32, sr)
+    # Explicitly request 32-bit float output. For WAV files this requests
+    # the 'FLOAT' subtype (32-bit floating point) instead of defaulting
+    # to 16-bit PCM.
+    try:
+        sf.write(dst, data32, sr, subtype='FLOAT')
+    except TypeError:
+        # Older soundfile versions may not accept subtype kwarg for some
+        # formats; fall back to default write behaviour.
+        sf.write(dst, data32, sr)
 
 
 def _ensure_float_array(data: np.ndarray) -> np.ndarray:
@@ -115,55 +123,40 @@ def _resample(data: np.ndarray, in_sr: float, out_sr: float) -> np.ndarray:
 
 
 def prepare(
-    src: AudioLike,
+    src: np.ndarray,
     cutoff_freq: int,
-    original_sr: Optional[int] = None,
+    original_sr: int,
     resampler_engine: str = 'scipy',
-    output: Optional[str] = None,
     apply_filter: bool = False,
     filter_passes: int = 3,
-) -> Tuple[Union[np.ndarray, str], int]:
-    """Prepare (slow down) an audio file or array.
+) -> Tuple[np.ndarray, int]:
+    """Prepare (slow down) an audio array.
 
-    Behaviour mirrors the original AudioProcessor.prepare(): it simulates a
-    virtual slowdown by interpreting the sample rate as a lower
-    "intermediate" rate (twice the cutoff frequency), then resamples the
-    audio back to the original sample rate so the result plays slower.
+    This function operates on NumPy arrays only. To process files see the
+    module-level CLI (main()).
 
     Args:
-        src: Path to audio file or (only allowed for the array variant) a
-             NumPy array. If passing an array you MUST also pass
-             ``original_sr``.
-        cutoff_freq: Target cutoff frequency (Hz). The intermediate sample
-             rate is computed as ``cutoff_freq * 2``.
-        original_sr: Required when ``src`` is a NumPy array. Ignored for
-             file input because the file's sample rate is used.
-        resampler_engine: Only 'scipy' is supported. Provided for API
-             compatibility.
-        output: Optional path where to save the processed audio. If not
-             provided the function returns the processed array and sample
-             rate.
+        src: NumPy array containing audio samples (shape: n or n x channels).
+        cutoff_freq: Target cutoff frequency (Hz). Intermediate sample
+             rate is computed as cutoff_freq * 2.
+        original_sr: Sample rate of ``src``.
+        resampler_engine: Only 'scipy' is supported.
         apply_filter: If True apply a multi-pass zero-phase filter after
-             resampling (uses SciPy's filtfilt). Defaults to False.
-        filter_passes: Number of filter passes (controls steepness).
+             resampling.
+        filter_passes: Number of filter passes for the filter.
 
     Returns:
-        A tuple of (processed, sr). If ``output`` is provided the "processed"
-        value is the output path string and the sr is the file sample rate.
-        Otherwise the processed NumPy array is returned alongside its
-        samplerate.
+        Tuple of (processed_array, sample_rate). The array is guaranteed to
+        be float32.
     """
     if resampler_engine != 'scipy':
         raise ValueError("Only 'scipy' resampler is supported by this module.")
 
-    # Load input
-    if isinstance(src, np.ndarray):
-        if original_sr is None:
-            raise ValueError("original_sr must be provided when src is a NumPy array")
-        data = _ensure_float_array(src)
-        sr = int(original_sr)
-    else:
-        data, sr = _read_audio(src)
+    if not isinstance(src, np.ndarray):
+        raise TypeError("prepare() accepts NumPy arrays only; use the CLI to process files.")
+
+    data = _ensure_float_array(src)
+    sr = int(original_sr)
 
     intermediate_sr = float(int(cutoff_freq) * 2)
 
@@ -177,49 +170,27 @@ def prepare(
     # Ensure output is 32-bit float (requirement)
     processed = _to_float32(processed)
 
-    if output:
-        _write_audio(output, processed, sr)
-        return output, sr
-
     return processed, sr
 
 
 def restore(
-    src: AudioLike,
+    src: np.ndarray,
     cutoff_freq: int,
-    original_sr: Optional[int] = None,
+    original_sr: int,
     resampler_engine: str = 'scipy',
-    output: Optional[str] = None,
-) -> Tuple[Union[np.ndarray, str], int]:
-    """Restore (speed up / compress) an audio file or array.
+) -> Tuple[np.ndarray, int]:
+    """Restore (speed up / compress) an audio array.
 
-    Mirrors AudioProcessor.restore(): the audio is resampled down to the
-    intermediate rate (``cutoff_freq * 2``), then the final sample rate is
-    interpreted back as the original sample rate to produce the restored
-    (faster) result.
-
-    Args:
-        src: Path or NumPy array (if array is used pass ``original_sr``).
-        cutoff_freq: Target cutoff frequency used previously to prepare the
-             file.
-        original_sr: Required if ``src`` is a NumPy array.
-        resampler_engine: Only 'scipy' is supported.
-        output: Optional output path to save processed audio.
-
-    Returns:
-        A tuple of (processed_or_path, sr). If ``output`` is provided the
-        first element is the path string; otherwise it is a NumPy array.
+    Operates on NumPy arrays only. For file processing use the CLI.
     """
     if resampler_engine != 'scipy':
         raise ValueError("Only 'scipy' resampler is supported by this module.")
 
-    if isinstance(src, np.ndarray):
-        if original_sr is None:
-            raise ValueError("original_sr must be provided when src is a NumPy array")
-        data = _ensure_float_array(src)
-        sr = int(original_sr)
-    else:
-        data, sr = _read_audio(src)
+    if not isinstance(src, np.ndarray):
+        raise TypeError("restore() accepts NumPy arrays only; use the CLI to process files.")
+
+    data = _ensure_float_array(src)
+    sr = int(original_sr)
 
     intermediate_sr = float(int(cutoff_freq) * 2)
 
@@ -229,12 +200,44 @@ def restore(
     # Ensure output is 32-bit float (requirement)
     processed = _to_float32(processed)
 
-    # The module keeps the final sample rate equal to the original sample
-    # rate to match the original restore semantics.
     final_sr = sr
 
-    if output:
-        _write_audio(output, processed, final_sr)
-        return output, final_sr
-
     return processed, final_sr
+
+
+def main() -> None:
+    """CLI entry point: read input file, run prepare or restore, write output file.
+
+    Usage (examples):
+      python -m Spectradownshift.skipy_slowdown_resample --prepare --cutoff 3000 in.wav out.wav
+      python -m Spectradownshift.skipy_slowdown_resample --restore --cutoff 3000 in.wav out.wav
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="skipy_slowdown_resample")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--prepare', action='store_true', help='Run prepare (slowdown)')
+    group.add_argument('--restore', action='store_true', help='Run restore (speedup)')
+    parser.add_argument('--cutoff', type=int, required=True, help='Cutoff frequency in Hz')
+    parser.add_argument('--apply-filter', action='store_true', help='Apply zero-phase filter (only for prepare)')
+    parser.add_argument('--filter-passes', type=int, default=3, help='Number of filter passes')
+    parser.add_argument('--engine', choices=['scipy'], default='scipy', help='Resampler engine (only scipy supported)')
+    parser.add_argument('input', help='Input audio file path')
+    parser.add_argument('output', help='Output audio file path')
+
+    args = parser.parse_args()
+
+    # Read input file
+    data, sr = _read_audio(args.input)
+
+    if args.prepare:
+        processed, out_sr = prepare(data, cutoff_freq=args.cutoff, original_sr=sr, resampler_engine=args.engine, apply_filter=args.apply_filter, filter_passes=args.filter_passes)
+    else:
+        processed, out_sr = restore(data, cutoff_freq=args.cutoff, original_sr=sr, resampler_engine=args.engine)
+
+    _write_audio(args.output, processed, out_sr)
+    print(f"Wrote {args.output} ({out_sr} Hz)")
+
+
+if __name__ == '__main__':
+    main()

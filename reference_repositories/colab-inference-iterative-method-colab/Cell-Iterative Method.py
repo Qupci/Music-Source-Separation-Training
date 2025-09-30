@@ -97,9 +97,9 @@ use_bs_resurrect = True #@param {type:"boolean"}
 use_mvsep = False #@param {type:"boolean"}
 
 #@markdown #### 2x Slowdown (additional separations, not replacements):
-use_2x_slowdown_mel_v1e = True #@param {type:"boolean"}
+use_2x_slowdown_mel_v1e = False #@param {type:"boolean"}
 use_2x_slowdown_bs_resurrect = True #@param {type:"boolean"}
-use_2x_slowdown_mvsep = True #@param {type:"boolean"}
+use_2x_slowdown_mvsep = False #@param {type:"boolean"}
 
 #@markdown #### Amplify masked details
 # When enabled, create the final pass by amplifying the
@@ -278,7 +278,7 @@ def write_wav_float(path, data, sr):
     sf.write(path, data_out, sr, subtype='FLOAT')
 
 
-def run_filter(wave, sr, pass_type, cutoff_hz, poles, taps):
+def run_filter(wave, sr, pass_type, cutoff_hz, poles, taps=513):
     print(f'Running linear-phase filter...')
     # lpf.filter_signal expects shape (samples, channels) or 1D (samples,)
     arr = wave
@@ -385,19 +385,32 @@ def ensure_dirs(path):
 def inject_side_from_bs(side_file, target_inject_path):
     """Read a bs_resurrect side_file, downmix to mono, ensemble with the
     S channel from target_inject_path and inject the ensembled mono back into
-    the S channel of the target. Returns (restored_path, side_restored_path).
+    the S channel of the target. Returns the path on success or None on failure.
     """
     try:
-        side_w, _ = read_wav_float(side_file)
+        side_w, side_sr = read_wav_float(side_file)
         # Downmix bs_resurrect output to mono
-        if side_w.ndim > 1 and side_w.shape[0] > 1:
-            bs_mono = np.mean(side_w, axis=0)
-        elif side_w.ndim == 1:
-            bs_mono = side_w
+        if isinstance(side_w, np.ndarray):
+            if side_w.ndim == 1:
+                bs_mono = side_w
+            elif side_w.ndim >= 2:
+                bs_mono = np.mean(side_w, axis=0)
+            else:
+                bs_mono = np.array(side_w)
         else:
-            bs_mono = side_w[0]
+            bs_mono = np.array(side_w)
 
-        np_next, _ = read_wav_float(target_inject_path)
+        np_next, target_sr = read_wav_float(target_inject_path)
+        # Normalize target shape to stereo (2, N)
+        if np_next.ndim == 1:
+            np_next = np.expand_dims(np_next, 0)
+        if np_next.ndim == 2 and np_next.shape[0] == 1:
+            np_next = np.vstack([np_next[0], np_next[0]])
+        if np_next.ndim == 2 and np_next.shape[0] > 2:
+            # unexpected multichannel: downmix to mono then duplicate to stereo
+            mono = np.mean(np_next, axis=0)
+            np_next = np.stack([mono, mono], axis=0)
+
         enc_ms = ms_encode(np_next)
         side_from_pass = enc_ms[1]
 
@@ -410,21 +423,32 @@ def inject_side_from_bs(side_file, target_inject_path):
         except Exception:
             ensembled = a_bs
 
-        if ensembled.ndim > 1 and ensembled.shape[0] > 1:
-            ensembled_mono = np.mean(ensembled, axis=0)
-        elif ensembled.ndim > 1:
-            ensembled_mono = ensembled[0]
+        # Normalize ensembled to mono 1-D array
+        if isinstance(ensembled, np.ndarray):
+            if ensembled.ndim > 1 and ensembled.shape[0] > 1:
+                ensembled_mono = np.mean(ensembled, axis=0)
+            elif ensembled.ndim > 1:
+                ensembled_mono = ensembled[0]
+            else:
+                ensembled_mono = ensembled
         else:
-            ensembled_mono = ensembled
+            ensembled_mono = a_bs[0]
+
+        # Ensure enc_ms is stereo
+        if enc_ms.ndim == 1:
+            enc_ms = np.expand_dims(enc_ms, 0)
+        if enc_ms.ndim == 2 and enc_ms.shape[0] == 1:
+            enc_ms = np.vstack([enc_ms[0], enc_ms[0]])
 
         enc_ms[1, :minlen2] = ensembled_mono[:minlen2]
         restored = ms_decode(enc_ms)
         # Overwrite the target file with injected result
-        write_wav_float(target_inject_path, restored, _)
+        write_wav_float(target_inject_path, restored, target_sr)
 
         return target_inject_path
-    except Exception:
-        return None, None
+    except Exception as e:
+        print('inject_side_from_bs failed:', e)
+        return None
 
 
 def choose_mvsep_send_input(iterative_folder, basename, iteration_target, mask, next_pass_path, input_path):
@@ -492,6 +516,29 @@ def reconstruct_next_pass_from_prev(prev_folder, prev_iter, iteration_target, ba
         sr = None
         for p in prev_model_files:
             w, sr = read_wav_float(p)
+            # Normalize channel layout: ensure stereo (2, N)
+            try:
+                if isinstance(w, np.ndarray):
+                    if w.ndim == 1:
+                        # mono -> duplicate to stereo
+                        w = np.expand_dims(w, 0)
+                    if w.ndim == 2:
+                        if w.shape[0] == 1:
+                            w = np.vstack([w[0], w[0]])
+                        elif w.shape[0] > 2:
+                            # downmix multichannel to mono then duplicate to stereo
+                            mono = np.mean(w, axis=0)
+                            w = np.stack([mono, mono], axis=0)
+                else:
+                    # coerce to numpy
+                    w = np.array(w)
+                    if w.ndim == 1:
+                        w = np.expand_dims(w, 0)
+                        w = np.vstack([w[0], w[0]])
+            except Exception:
+                # if normalization fails, skip this file
+                print(f'Warning: skipping malformed model output {p}')
+                continue
             waves.append(w)
         if not waves:
             return None
@@ -546,23 +593,20 @@ def reconstruct_next_pass_from_prev(prev_folder, prev_iter, iteration_target, ba
         next_pass_path = os.path.join(iterative_folder, next_pass_filename)
         write_wav_float(next_pass_path, next_pass, src_sr)
         print(f'Reconstructed missing next-pass from previous iteration outputs: {next_pass_path}')
+
         # Inject previous iteration side restoration result (preferred) OR fallback logic.
-        # When resuming into the final pass, we still want the pass{prev_iter} side
-        # contribution baked into the pass{iteration_target} input, because downstream
-        # finisher variants assume the iterative chain already incorporated it.
+        # This implementation avoids rereading ensemble_res and simply injects/overwrites
+        # the reconstructed next_pass file's S channel with the ensembled side.
         try:
             if restore_side_iterative and src_w.shape[0] >= 2:
-                # 1. Prefer an existing side result produced during the previous iteration
                 prev_side_store = os.path.join(prev_folder, 'side_res')
                 prev_side_base = f'{basename}_pass{prev_iter}_side'
                 prev_side_found = find_model_output_for_file(prev_side_store, prev_side_base, '_other') if os.path.exists(prev_side_store) else []
+                side_source = None
                 if prev_side_found:
-                    # Directly inject previous iteration side into the reconstructed next-pass
-                    inject_side_from_bs(prev_side_found[0], next_pass_path)
+                    side_source = prev_side_found[0]
                 else:
-                    # 2. Fallback: (re)derive side from the previous source and run a lightweight
-                    #    bs_resurrect pass inside the NEW iteration folder (only if not already done).
-                    #    This mirrors the original behaviour but now also allowed for final pass resumes.
+                    # prepare a derived side file and run bs_resurrect if needed
                     L = src_cut[0]
                     R = src_cut[1]
                     side = (L - R) * 0.5
@@ -577,11 +621,64 @@ def reconstruct_next_pass_from_prev(prev_folder, prev_iter, iteration_target, ba
                             res = run_local_inference('bs_resurrect', side_path, side_store_new)
                             if res and res.returncode == 0:
                                 time.sleep(0.5)
-                        except Exception as e:
-                            print('Exception while running side separation during reconstruction fallback:', e)
+                        except Exception:
+                            pass
                         new_side_found = find_model_output_for_file(side_store_new, f'{basename}_pass{iteration_target}_side', '_other')
                     if new_side_found:
-                        inject_side_from_bs(new_side_found[0], next_pass_path)
+                        side_source = new_side_found[0]
+
+                if side_source:
+                    # Read bs_res output and inject into next_pass_path without re-assembling ensemble_res
+                    try:
+                        side_w, _ = read_wav_float(side_source)
+                        if isinstance(side_w, np.ndarray):
+                            if side_w.ndim == 1:
+                                bs_mono = side_w
+                            else:
+                                bs_mono = np.mean(side_w, axis=0)
+                        else:
+                            bs_mono = np.array(side_w)
+
+                        np_next, _ = read_wav_float(next_pass_path)
+                        # normalize np_next to stereo
+                        if np_next.ndim == 1:
+                            np_next = np.expand_dims(np_next, 0)
+                        if np_next.ndim == 2 and np_next.shape[0] == 1:
+                            np_next = np.vstack([np_next[0], np_next[0]])
+                        if np_next.ndim == 2 and np_next.shape[0] > 2:
+                            mono = np.mean(np_next, axis=0)
+                            np_next = np.stack([mono, mono], axis=0)
+
+                        enc_ms = ms_encode(np_next)
+                        side_from_pass = enc_ms[1]
+                        minlen2 = min(bs_mono.shape[0], side_from_pass.shape[0])
+                        a_bs = np.expand_dims(bs_mono[:minlen2], 0)
+                        a_pass_side = np.expand_dims(side_from_pass[:minlen2], 0)
+                        try:
+                            ensembled = average_waveforms([a_bs, a_pass_side], [1.0, 1.0], 'max_fft')
+                        except Exception:
+                            ensembled = a_bs
+                        # normalize ensembled
+                        if isinstance(ensembled, np.ndarray):
+                            if ensembled.ndim > 1 and ensembled.shape[0] > 1:
+                                ensembled_mono = np.mean(ensembled, axis=0)
+                            elif ensembled.ndim > 1:
+                                ensembled_mono = ensembled[0]
+                            else:
+                                ensembled_mono = ensembled
+                        else:
+                            ensembled_mono = a_bs[0]
+
+                        if enc_ms.ndim == 1:
+                            enc_ms = np.expand_dims(enc_ms, 0)
+                        if enc_ms.ndim == 2 and enc_ms.shape[0] == 1:
+                            enc_ms = np.vstack([enc_ms[0], enc_ms[0]])
+
+                        enc_ms[1, :minlen2] = ensembled_mono[:minlen2]
+                        restored = ms_decode(enc_ms)
+                        write_wav_float(next_pass_path, restored, src_sr)
+                    except Exception as e:
+                        print('Side injection (fallback) failed:', e)
         except Exception as e:
             print('Side restoration injection during reconstruction failed (non-fatal):', e)
 
@@ -1038,8 +1135,22 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
         # Prepare slowed input once
         if not os.path.exists(slowed_input_path):
             try:
-                slowed_arr, _srp = prepare(input_path, cutoff_freq=CUTOFF_2X)
-                write_wav_float(slowed_input_path, slowed_arr, 44100)
+                # read the input as channels-first array and convert to samples-first
+                src_arr, src_sr = read_wav_float(input_path)
+                if isinstance(src_arr, np.ndarray) and src_arr.ndim == 2:
+                    src_samples = src_arr.T
+                    # if single-channel, make it 1D
+                    if src_samples.shape[1] == 1:
+                        src_samples = src_samples[:, 0]
+                else:
+                    src_samples = src_arr
+                slowed_arr, _srp = prepare(src_samples, cutoff_freq=CUTOFF_2X, original_sr=src_sr)
+                # prepare() returns samples-first; convert back to channels-first for writing
+                if isinstance(slowed_arr, np.ndarray) and slowed_arr.ndim == 2 and slowed_arr.shape[0] > slowed_arr.shape[1]:
+                    slowed_out = slowed_arr.T
+                else:
+                    slowed_out = slowed_arr
+                write_wav_float(slowed_input_path, slowed_out, src_sr)
             except Exception as e:
                 print('[2x] Failed preparing slowed input:', e)
                 slowed_input_path = None
@@ -1059,13 +1170,22 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
                         return None
                     sep_path = outs[0]
                     try:
-                        restored_arr, _ = restore(sep_path, cutoff_freq=CUTOFF_2X)
-                        try:
-                            filtered = run_filter(restored_arr, 44100, 'bhp', 2000, 3, 2049)
-                        except Exception:
-                            filtered = restored_arr
+                        # read separated file and use array-based restore
+                        sep_w, sep_sr = read_wav_float(sep_path)
+                        # convert channels-first to samples-first expected by restore
+                        if isinstance(sep_w, np.ndarray) and sep_w.ndim == 2:
+                            sep_samples = sep_w.T
+                            if sep_samples.shape[1] == 1:
+                                sep_samples = sep_samples[:, 0]
+                        else:
+                            sep_samples = sep_w
+                        restored_arr, sr_rest = restore(sep_samples, cutoff_freq=CUTOFF_2X, original_sr=sep_sr)
+                        # try:
+                        #     filtered = run_filter(restored_arr, sr_rest, 'bhp', 2000, 3, 2049)
+                        # except Exception:
+                        #     filtered = restored_arr
                         filt_path = os.path.join(tgt, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
-                        write_wav_float(filt_path, filtered, 44100)
+                        write_wav_float(filt_path, restored_arr, sr_rest)
                         return filt_path
                     except Exception as e:
                         print('[2x] restore/filter failed:', e)
@@ -1093,13 +1213,21 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
                     if outs:
                         sep_path = outs[0]
                         try:
-                            restored_arr, _ = restore(sep_path, cutoff_freq=CUTOFF_2X)
-                            try:
-                                filtered = run_filter(restored_arr, 44100, 'bhp', 2000, 3, 2049)
-                            except Exception:
-                                filtered = restored_arr
+                            sep_w, sep_sr = read_wav_float(sep_path)
+                            # convert to samples-first
+                            if isinstance(sep_w, np.ndarray) and sep_w.ndim == 2:
+                                sep_samples = sep_w.T
+                                if sep_samples.shape[1] == 1:
+                                    sep_samples = sep_samples[:, 0]
+                            else:
+                                sep_samples = sep_w
+                            restored_arr, sr_rest = restore(sep_samples, cutoff_freq=CUTOFF_2X, original_sr=sep_sr)
+                            # try:
+                            #     filtered = run_filter(restored_arr, sr_rest, 'bhp', 2000, 3, 2049)
+                            # except Exception:
+                            #     filtered = restored_arr
                             filt_path = os.path.join(mv_sub, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
-                            write_wav_float(filt_path, filtered, 44100)
+                            write_wav_float(filt_path, restored_arr, sr_rest)
                             model_results.append(filt_path)
                         except Exception as e:
                             print('[2x] mvsep restore/filter failed:', e)
@@ -1207,8 +1335,7 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
         next_pass_path = os.path.join(next_iter_folder, next_pass_filename)
         write_wav_float(next_pass_path, next_pass, src_sr)
     # Side restoration (iterative): only run for iterative passes (not the final/finisher pass).
-    # This avoids creating a `_side.wav` and running bs_resurrect for the finisher iteration,
-    # where finisher side restoration is handled separately by `restore_side_variant`.
+    # Inject ensembled side into the reconstructed next_pass file when available.
     if restore_side_iterative and src_w.shape[0] >= 2 and (not is_final):
         side_store = os.path.join(iterative_folder, 'side_res')
         ensure_dirs(side_store)
@@ -1218,71 +1345,77 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
             R = src_w[1, :minlen]
             side = (L - R) * 0.5
             side_stereo = np.stack([side, side], axis=0)
-            write_wav_float(side_path, side_stereo, sr)
+            write_wav_float(side_path, side_stereo, src_sr)
         except Exception:
             pass
 
-        # Run side separation synchronously (treat it like other local models).
-        # If a previous side result exists, skip running inference to avoid overwriting.
         try:
             side_base = f'{basename}_pass{iteration_target}_side'
             side_found = find_model_output_for_file(side_store, side_base, '_other')
             if not side_found:
-                # run synchronously and capture output
                 try:
                     res = run_local_inference('bs_resurrect', side_path, side_store)
-                    if res.returncode != 0:
-                        print(f"Side separation returned non-zero: returncode={res.returncode}")
-                        print('stdout:', res.stdout)
-                        print('stderr:', res.stderr)
-                    else:
-                        # allow small time for files to be written
+                    if res and res.returncode == 0:
                         time.sleep(0.5)
                 except Exception as e:
                     print('Exception while running side separation:', e)
                 side_found = find_model_output_for_file(side_store, side_base, '_other')
 
-            if side_found:
-                side_file = side_found[0]
-                side_w, _ = read_wav_float(side_file)
-                # Downmix bs_resurrect output to mono
-                if side_w.ndim > 1 and side_w.shape[0] > 1:
-                    bs_mono = np.mean(side_w, axis=0)
-                elif side_w.ndim == 1:
-                    bs_mono = side_w
-                else:
-                    bs_mono = side_w[0]
-
-                target_inject_path = next_pass_path 
-                np_next, _ = read_wav_float(target_inject_path)
-                enc_ms = ms_encode(np_next)
-                side_from_pass = enc_ms[1]
-
-                # Create two mono signals for ensemble: left==bs_res downmix, right==side from pass
-                minlen2 = min(bs_mono.shape[0], side_from_pass.shape[0])
-                a_bs = np.expand_dims(bs_mono[:minlen2], 0)
-                a_pass_side = np.expand_dims(side_from_pass[:minlen2], 0)
-
-                # Perform max-FFT ensemble on the two mono signals
+            if side_found and next_pass_path and os.path.exists(next_pass_path):
                 try:
-                    ensembled = average_waveforms([a_bs, a_pass_side], [1.0, 1.0], 'max_fft')
-                except Exception:
-                    ensembled = a_bs
+                    side_file = side_found[0]
+                    side_w, _ = read_wav_float(side_file)
+                    # Downmix bs_resurrect output to mono
+                    if isinstance(side_w, np.ndarray):
+                        if side_w.ndim == 1:
+                            bs_mono = side_w
+                        else:
+                            bs_mono = np.mean(side_w, axis=0)
+                    else:
+                        bs_mono = np.array(side_w)
 
-                # Normalize ensemble shape to mono 1D
-                if ensembled.ndim > 1 and ensembled.shape[0] > 1:
-                    ensembled_mono = np.mean(ensembled, axis=0)
-                elif ensembled.ndim > 1:
-                    ensembled_mono = ensembled[0]
-                else:
-                    ensembled_mono = ensembled
+                    np_next, _ = read_wav_float(next_pass_path)
+                    # normalize np_next to stereo
+                    if np_next.ndim == 1:
+                        np_next = np.expand_dims(np_next, 0)
+                    if np_next.ndim == 2 and np_next.shape[0] == 1:
+                        np_next = np.vstack([np_next[0], np_next[0]])
+                    if np_next.ndim == 2 and np_next.shape[0] > 2:
+                        mono = np.mean(np_next, axis=0)
+                        np_next = np.stack([mono, mono], axis=0)
 
-                # Inject the ensembled mono into the S channel of the target and decode back to stereo
-                enc_ms[1, :minlen2] = ensembled_mono[:minlen2]
-                restored = ms_decode(enc_ms)
-                write_wav_float(target_inject_path, restored, sr)
-        except Exception:
-            pass
+                    enc_ms = ms_encode(np_next)
+                    side_from_pass = enc_ms[1]
+                    minlen2 = min(bs_mono.shape[0], side_from_pass.shape[0])
+                    a_bs = np.expand_dims(bs_mono[:minlen2], 0)
+                    a_pass_side = np.expand_dims(side_from_pass[:minlen2], 0)
+                    try:
+                        ensembled = average_waveforms([a_bs, a_pass_side], [1.0, 1.0], 'max_fft')
+                    except Exception:
+                        ensembled = a_bs
+
+                    if isinstance(ensembled, np.ndarray):
+                        if ensembled.ndim > 1 and ensembled.shape[0] > 1:
+                            ensembled_mono = np.mean(ensembled, axis=0)
+                        elif ensembled.ndim > 1:
+                            ensembled_mono = ensembled[0]
+                        else:
+                            ensembled_mono = ensembled
+                    else:
+                        ensembled_mono = a_bs[0]
+
+                    if enc_ms.ndim == 1:
+                        enc_ms = np.expand_dims(enc_ms, 0)
+                    if enc_ms.ndim == 2 and enc_ms.shape[0] == 1:
+                        enc_ms = np.vstack([enc_ms[0], enc_ms[0]])
+
+                    enc_ms[1, :minlen2] = ensembled_mono[:minlen2]
+                    restored = ms_decode(enc_ms)
+                    write_wav_float(next_pass_path, restored, src_sr)
+                except Exception as e:
+                    print('Side injection failed:', e)
+        except Exception as e:
+            print('Side restoration (iterative) failed (non-fatal):', e)
 
     # If we created a next_pass (intermediate iteration), return its path.
     if next_pass_path is not None:
