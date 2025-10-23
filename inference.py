@@ -37,9 +37,18 @@ def run_folder(model, args, config, device, verbose=False):
         sample_rate = config.audio['sample_rate']
     print('Total files found: {} Use sample rate: {}'.format(len(all_mixtures_path), sample_rate))
 
-    instruments = prefer_target_instrument(config)
+    if getattr(args, 'output_file', None):
+        if len(all_mixtures_path) != 1:
+            raise ValueError('--output_file can only be used when processing a single input file')
+        output_dir_override = os.path.dirname(args.output_file)
+        if output_dir_override:
+            os.makedirs(output_dir_override, exist_ok=True)
+    else:
+        if not args.store_dir:
+            raise ValueError('Either --store_dir or --output_file must be provided')
+        os.makedirs(args.store_dir, exist_ok=True)
 
-    os.makedirs(args.store_dir, exist_ok=True)
+    instruments = prefer_target_instrument(config)
 
     if not verbose:
         all_mixtures_path = tqdm(all_mixtures_path, desc="Total progress")
@@ -119,13 +128,30 @@ def run_folder(model, args, config, device, verbose=False):
                 if config.inference['normalize'] is True:
                     estimates = estimates * std + mean
             file_name, _ = os.path.splitext(os.path.basename(path))
-            if args.flac_file:
-                output_file = os.path.join(args.store_dir, f"{file_name}_{instr}.flac")
-                subtype = 'PCM_16' if args.pcm_type == 'PCM_16' else 'PCM_24'
+
+            if getattr(args, 'output_file', None):
+                base_dir = os.path.dirname(args.output_file)
+                base_dir = base_dir if base_dir else '.'
+                override_base, override_ext = os.path.splitext(os.path.basename(args.output_file))
+                override_ext = override_ext.lower()
+                if override_ext not in {'.wav', '.flac'}:
+                    override_ext = '.flac' if args.flac_file else '.wav'
+
+                if override_ext == '.flac':
+                    subtype = 'PCM_16' if args.pcm_type == 'PCM_16' else 'PCM_24'
+                else:
+                    subtype = 'FLOAT'
+
+                output_file = os.path.join(base_dir, f"{override_base}_{instr}{override_ext}")
                 sf.write(output_file, estimates, sr, subtype=subtype)
             else:
-                output_file = os.path.join(args.store_dir, f"{file_name}_{instr}.wav")
-                sf.write(output_file, estimates, sr, subtype='FLOAT')
+                if args.flac_file:
+                    output_file = os.path.join(args.store_dir, f"{file_name}_{instr}.flac")
+                    subtype = 'PCM_16' if args.pcm_type == 'PCM_16' else 'PCM_24'
+                    sf.write(output_file, estimates, sr, subtype=subtype)
+                else:
+                    output_file = os.path.join(args.store_dir, f"{file_name}_{instr}.wav")
+                    sf.write(output_file, estimates, sr, subtype='FLOAT')
 
     time.sleep(1)
     print("Elapsed time: {:.2f} sec".format(time.time() - start_time))
@@ -139,6 +165,7 @@ def proc_folder(args):
     parser.add_argument("--input_folder", type=str, help="folder with mixtures to process")
     parser.add_argument("--input_file", type=str, help="single mixture file to process")
     parser.add_argument("--store_dir", default="", type=str, help="path to store results as wav file")
+    parser.add_argument("--output_file", default="", type=str, help="override base output path (no instrument suffix); only valid with single input")
     parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
     parser.add_argument("--extract_instrumental", action='store_true', help="invert vocals to get instrumental if provided")
     parser.add_argument("--disable_detailed_pbar", action='store_true', help="disable detailed progress bar")
