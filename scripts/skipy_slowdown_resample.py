@@ -116,10 +116,27 @@ def _resample(data: np.ndarray, in_sr: float, out_sr: float) -> np.ndarray:
     if scipy_resample is None:
         raise ImportError("SciPy is required for resampling. Install 'scipy' to use this module.")
 
-    num_samples = int(np.round(len(data) * out_sr / in_sr))
+    if in_sr <= 0 or out_sr <= 0:
+        raise ValueError("Sample rates must be positive non-zero values.")
+
+    arr = np.asarray(data)
+    length = arr.shape[0]
+
+    if length == 0:
+        # Nothing to resample; return an appropriately typed empty array.
+        return _to_float32(arr)
+
+    num_samples = int(np.round(length * float(out_sr) / float(in_sr)))
+    if num_samples < 1:
+        # For extremely short clips numerical rounding can yield zero which
+        # leads to division-by-zero inside scipy.signal.resample. Preserve at
+        # least one sample so the caller can continue processing.
+        num_samples = 1
+
     # scipy_resample operates along axis=0 (samples x channels) which matches
     # our arrays shaped as (n_samples,) or (n_samples, channels)
-    return scipy_resample(data, num_samples, axis=0)
+    resampled = scipy_resample(arr, num_samples, axis=0)
+    return _to_float32(resampled)
 
 
 def prepare(

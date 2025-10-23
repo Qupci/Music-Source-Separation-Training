@@ -19,6 +19,11 @@ bitstring = "0111"
 encoded = encode_bitstring(bitstring)
 decoded = decode_bitmask(encoded, len(bitstring))
 
+value = "46"
+bitstring_len = 8
+decoded = decode_bitmask(int(value), bitstring_len)
+encoded = encode_bitstring(decoded)
+
 print("Bitstring:", bitstring)
 print("Encoded :", encoded)
 print("Decoded :", decoded)
