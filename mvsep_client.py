@@ -19,7 +19,8 @@ class MVSEPClient:
     def _log_debug(self, message: str) -> None:
         """Helper method for debug logging"""
         if self.debug:
-            print(f"[DEBUG] {message}")
+            pass
+            # print(f"[DEBUG] {message}")
 
     def _make_request(self, method: str, endpoint: str, 
                     params: Optional[Dict] = None, data: Optional[Dict] = None,
