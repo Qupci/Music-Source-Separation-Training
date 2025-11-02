@@ -19,8 +19,7 @@ class MVSEPClient:
     def _log_debug(self, message: str) -> None:
         """Helper method for debug logging"""
         if self.debug:
-            pass
-            # print(f"[DEBUG] {message}")
+            print(f"[DEBUG] {message}")
 
     def _make_request(self, method: str, endpoint: str, 
                     params: Optional[Dict] = None, data: Optional[Dict] = None,
@@ -278,7 +277,7 @@ class MVSEPClient:
         while True:
             status_resp = self.get_separation_status(task_hash)
             status = status_resp.get("status")
-            self._log_debug(f"wait_for_done status: {status}")
+            # self._log_debug(f"wait_for_done status: {status}")
             if status == "done":
                 return status_resp
             if status in ("failed", "error"):
