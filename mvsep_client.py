@@ -19,8 +19,7 @@ class MVSEPClient:
     def _log_debug(self, message: str) -> None:
         """Helper method for debug logging"""
         if self.debug:
-            pass
-            # print(f"[DEBUG] {message}")
+            print(f"[DEBUG] {message}")
 
     def _make_request(self, method: str, endpoint: str, 
                     params: Optional[Dict] = None, data: Optional[Dict] = None,
@@ -125,13 +124,13 @@ class MVSEPClient:
             raise ValueError("Either file_path or url must be provided")
 
     def get_separation_status(self, task_hash: str, mirror: int = 0) -> Dict:
-        self._log_debug(f"Getting status for hash: {task_hash}, mirror={mirror}")
+        # self._log_debug(f"Getting status for hash: {task_hash}, mirror={mirror}")
         params = {"hash": task_hash, "mirror": str(mirror)}
         if mirror == 1:
             params["api_token"] = self.api_key
         response = self._make_request("GET", "separation/get", params=params)
         json_response = response.json()
-        self._log_debug(f"Status response: {json_response}")
+        # self._log_debug(f"Status response: {json_response}")
         return json_response
 
     def download_track(self, url: str, output_path: str) -> None:
