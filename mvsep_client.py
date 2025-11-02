@@ -26,9 +26,9 @@ class MVSEPClient:
                     files: Optional[Dict] = None, stream: bool = False) -> requests.Response:
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         
-        self._log_debug(f"Making {method} request to {url}")
-        self._log_debug(f"Params: {params}")
-        self._log_debug(f"Data: {data}")
+        # self._log_debug(f"Making {method} request to {url}")
+        # self._log_debug(f"Params: {params}")
+        # self._log_debug(f"Data: {data}")
         if files:
             self._log_debug(f"Files: {list(files.keys())} (content not logged)")
         
@@ -45,7 +45,7 @@ class MVSEPClient:
                 )
                 
                 self._log_debug(f"Response status: {response.status_code}")
-                self._log_debug(f"Response headers: {dict(response.headers)}")
+                # self._log_debug(f"Response headers: {dict(response.headers)}")
                 
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", self.retry_interval))
