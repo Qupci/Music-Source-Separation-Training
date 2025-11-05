@@ -44,8 +44,8 @@ class MVSEPClient:
                     timeout=(600, 1200)
                 )
                 
-                self._log_debug(f"Response status: {response.status_code}")
-                # self._log_debug(f"Response headers: {dict(response.headers)}")
+                # self._log_debug(f"Response status: {response.status_code}")
+                self._log_debug(f"Response headers: {dict(response.headers)}")
                 
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", self.retry_interval))
