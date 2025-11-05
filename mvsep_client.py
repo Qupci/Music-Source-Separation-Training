@@ -44,18 +44,16 @@ class MVSEPClient:
                     timeout=(600, 1200)
                 )
                 
-                self._log_debug(f"Response status: {response.status_code}")
+                # self._log_debug(f"Response status: {response.status_code}")
                 self._log_debug(f"Response headers: {dict(response.headers)}")
                 
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", self.retry_interval))
                     self._log_debug(f"Rate limited, retrying after {retry_after}s")
-                    response.close()
                     time.sleep(retry_after)
                     continue
                 if response.status_code == 400:
-                    self._log_debug(f"Bad request (400), closing connection and retrying (attempt {attempt + 1}/{self.retries + 1})")
-                    response.close()
+                    #print(response)
                     time.sleep(self.retry_interval)
                     continue
                 if 500 <= response.status_code < 600 and attempt < self.retries:
