@@ -48,7 +48,7 @@ def run_folder(model, args, config, device, verbose=False):
             raise ValueError('Either --store_dir or --output_file must be provided')
         os.makedirs(args.store_dir, exist_ok=True)
 
-    instruments = prefer_target_instrument(config)
+    instruments = list(prefer_target_instrument(config))
     instrumental_mode = int(getattr(args, 'extract_instrumental', 0) or 0)
     instrumental_only = instrumental_mode == 2
 
@@ -127,9 +127,6 @@ def run_folder(model, args, config, device, verbose=False):
                 # If there are elements in second_stem, use the first one (or handle according to your logic)
                 second_stem_key = second_stem[0]  
                 
-                if second_stem_key not in instruments:
-                    instruments.append(second_stem_key)
-                
                 # Output "instrumental", which is an inverse of 'vocals' or the first stem in list if 'vocals' absent
                 waveforms[second_stem_key] = mix_orig - waveforms[instruments[0]]
                 instrumental_output_key = second_stem_key
@@ -138,9 +135,14 @@ def run_folder(model, args, config, device, verbose=False):
             for key in waveforms:
                 waveforms[key] = waveforms[key][::-1].copy()
 
-        for instr in instruments:
-            if instrumental_only and instrumental_output_key and instr != instrumental_output_key:
-                continue
+        export_instruments = list(instruments)
+        if instrumental_output_key:
+            if instrumental_only:
+                export_instruments = [instrumental_output_key]
+            elif instrumental_output_key not in export_instruments:
+                export_instruments.append(instrumental_output_key)
+
+        for instr in export_instruments:
             estimates = waveforms[instr].T
             if 'normalize' in config.inference:
                 if config.inference['normalize'] is True:
