@@ -49,6 +49,8 @@ def run_folder(model, args, config, device, verbose=False):
         os.makedirs(args.store_dir, exist_ok=True)
 
     instruments = prefer_target_instrument(config)
+    instrumental_mode = int(getattr(args, 'extract_instrumental', 0) or 0)
+    instrumental_only = instrumental_mode == 2
 
     if not verbose:
         all_mixtures_path = tqdm(all_mixtures_path, desc="Total progress")
@@ -59,6 +61,7 @@ def run_folder(model, args, config, device, verbose=False):
         detailed_pbar = True
 
     for path in all_mixtures_path:
+        instrumental_output_key = None
         print("Starting processing track: ", path)
         if not verbose:
             all_mixtures_path.set_postfix({'track': os.path.basename(path)})
@@ -72,6 +75,14 @@ def run_folder(model, args, config, device, verbose=False):
         # Convert mono to stereo if needed
         if len(mix.shape) == 1:
             mix = np.stack([mix, mix], axis=0)
+
+        swap_applied = False
+        if args.swap_stereo:
+            if mix.shape[0] != 2:
+                print('Warning: --swap-stereo ignored because audio is not stereo ({} channels)'.format(mix.shape[0]))
+            else:
+                mix = mix[::-1].copy()
+                swap_applied = True
 
         mix_orig = mix.copy()
         if 'normalize' in config.inference:
@@ -107,7 +118,7 @@ def run_folder(model, args, config, device, verbose=False):
             waveforms[el] = waveforms[el] / len(full_result)
 
         # Create a new `instr` in instruments list, 'instrumental' 
-        if args.extract_instrumental and config.training.target_instrument is not None:
+        if instrumental_mode and config.training.target_instrument is not None:
             # Create a list of instruments excluding the target instrument
             second_stem = [s for s in config.training.instruments if s != config.training.target_instrument]
             
@@ -121,8 +132,15 @@ def run_folder(model, args, config, device, verbose=False):
                 
                 # Output "instrumental", which is an inverse of 'vocals' or the first stem in list if 'vocals' absent
                 waveforms[second_stem_key] = mix_orig - waveforms[instruments[0]]
+                instrumental_output_key = second_stem_key
+
+        if swap_applied:
+            for key in waveforms:
+                waveforms[key] = waveforms[key][::-1].copy()
 
         for instr in instruments:
+            if instrumental_only and instrumental_output_key and instr != instrumental_output_key:
+                continue
             estimates = waveforms[instr].T
             if 'normalize' in config.inference:
                 if config.inference['normalize'] is True:
@@ -167,12 +185,21 @@ def proc_folder(args):
     parser.add_argument("--store_dir", default="", type=str, help="path to store results as wav file")
     parser.add_argument("--output_file", default="", type=str, help="override base output path (no instrument suffix); only valid with single input")
     parser.add_argument("--device_ids", nargs='+', type=int, default=0, help='list of gpu ids')
-    parser.add_argument("--extract_instrumental", action='store_true', help="invert vocals to get instrumental if provided")
+    parser.add_argument(
+        "--extract_instrumental",
+        type=int,
+        choices=[0, 1, 2],
+        default=0,
+        nargs='?',
+        const=1,
+        help="Instrumental extraction mode: 0=disabled, 1=save both original stems and instrumental, 2=save only the instrumental output"
+    )
     parser.add_argument("--disable_detailed_pbar", action='store_true', help="disable detailed progress bar")
     parser.add_argument("--force_cpu", action = 'store_true', help="Force the use of CPU even if CUDA is available")
     parser.add_argument("--flac_file", action = 'store_true', help="Output flac file instead of wav")
     parser.add_argument("--pcm_type", type=str, choices=['PCM_16', 'PCM_24'], default='PCM_24', help="PCM type for FLAC files (PCM_16 or PCM_24)")
     parser.add_argument("--use_tta", action='store_true', help="Flag adds test time augmentation during inference (polarity and channel inverse). While this triples the runtime, it reduces noise and slightly improves prediction quality.")
+    parser.add_argument("--swap-stereo", dest='swap_stereo', action='store_true', help="Swap stereo channels before inference and swap them back on the outputs")
     if args is None:
         args = parser.parse_args()
     else:
