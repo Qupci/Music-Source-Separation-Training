@@ -79,7 +79,7 @@ def run_folder(model, args, config, device, verbose=False):
         swap_applied = False
         if args.swap_stereo:
             if mix.shape[0] != 2:
-                print('Warning: --swap-stereo ignored because audio is not stereo ({} channels)'.format(mix.shape[0]))
+                print('Warning: --swap_stereo ignored because audio is not stereo ({} channels)'.format(mix.shape[0]))
             else:
                 mix = mix[::-1].copy()
                 swap_applied = True
@@ -199,7 +199,7 @@ def proc_folder(args):
     parser.add_argument("--flac_file", action = 'store_true', help="Output flac file instead of wav")
     parser.add_argument("--pcm_type", type=str, choices=['PCM_16', 'PCM_24'], default='PCM_24', help="PCM type for FLAC files (PCM_16 or PCM_24)")
     parser.add_argument("--use_tta", action='store_true', help="Flag adds test time augmentation during inference (polarity and channel inverse). While this triples the runtime, it reduces noise and slightly improves prediction quality.")
-    parser.add_argument("--swap-stereo", dest='swap_stereo', action='store_true', help="Swap stereo channels before inference and swap them back on the outputs")
+    parser.add_argument("--swap_stereo", dest='swap_stereo', action='store_true', help="Swap stereo channels before inference and swap them back on the outputs")
     if args is None:
         args = parser.parse_args()
     else:
