@@ -2,17 +2,20 @@
 
 Usage (CLI):
   python scripts/linear_phase_filter.py --infile input.wav --outfile out.wav --type lp --freq 1000 --poles 2
+  python scripts/linear_phase_filter.py --infile in.wav --outfile out.wav --type bbp --freq 15600 --freq2 15750
 
 Supported filter types:
 - `lp`: linear-phase lowpass (designs an FIR approximation using windowed-sinc)
 - `hp`: linear-phase highpass (spectral inversion of lowpass)
 - `blp`: brickwall lowpass (very steep FIR using large taps)
 - `bhp`: brickwall highpass (spectral inversion of `blp`)
+- `bbp`: brickwall bandpass (combines `bhp` at `freq` with `blp` at `freq2`)
 
 Parameters:
 - `poles`: integer multiple of 2 -> used for IIR magnitude approximation then converted to FIR. Default 2 (i.e. 12 dB/oct).
 - `q`: quality factor (default 1/sqrt(2) for Butterworth-like)
 - `freq`: cutoff frequency in Hz
+- `freq2`: upper cutoff frequency in Hz (only used for `bbp`)
 
 This script supports mono and stereo WAV files. It uses numpy and scipy.
 """
@@ -73,17 +76,28 @@ def apply_filter(signal_in: np.ndarray, taps: np.ndarray) -> np.ndarray:
     return out
 
 
-def filter_signal(data: np.ndarray, fs: int, pass_type: str, freq: float, poles: int = 2, q: float = 1.0 / math.sqrt(2.0), taps_count: int = 513) -> np.ndarray:
+def filter_signal(data: np.ndarray, fs: int, pass_type: str, freq: float, poles: int = 2, q: float = 1.0 / math.sqrt(2.0), taps_count: int = 513, freq2: Optional[float] = None) -> np.ndarray:
     """Apply the configured linear-phase filter to an in-memory audio array.
 
     - `data`: shape (N,) or (N, C)
     - `fs`: sample rate
-    - `pass_type`: one of 'lp','hp','blp','bhp'
-    - `freq`: cutoff frequency in Hz
+    - `pass_type`: one of 'lp','hp','blp','bhp','bbp'
+    - `freq`: cutoff frequency in Hz (lower cutoff for 'bbp')
+    - `freq2`: upper cutoff frequency in Hz (required for 'bbp')
     - other args follow the CLI naming
 
     Returns filtered array with same shape as input (float32).
     """
+    if pass_type == "bbp":
+        if freq2 is None:
+            raise ValueError("freq2 is required for 'bbp' (brickwall bandpass) filter type")
+        if freq >= freq2:
+            raise ValueError(f"freq ({freq}) must be less than freq2 ({freq2}) for bandpass")
+        # bbp = bhp at freq followed by blp at freq2
+        out = filter_signal(data, fs, "bhp", freq, poles=poles, q=q, taps_count=taps_count)
+        out = filter_signal(out, fs, "blp", freq2, poles=poles, q=q, taps_count=taps_count)
+        return out
+
     # Ensure shape (N, C)
     arr = data
     if arr.ndim == 1:
@@ -188,8 +202,9 @@ def main(argv: Optional[list[str]] = None, *, data: Optional[np.ndarray] = None,
     parser = argparse.ArgumentParser(description="Apply linear-phase highpass/lowpass filters to WAV files")
     parser.add_argument("--infile", help="Input WAV path")
     parser.add_argument("--outfile", help="Output WAV path")
-    parser.add_argument("--type", choices=["lp", "hp", "blp", "bhp"], default="lp", help="Filter type")
+    parser.add_argument("--type", choices=["lp", "hp", "blp", "bhp", "bbp"], default="lp", help="Filter type")
     parser.add_argument("--freq", type=float, required=(data is None or fs is None), help="Cutoff frequency in Hz")
+    parser.add_argument("--freq2", type=float, default=None, help="Upper cutoff frequency in Hz (required for bbp)")
     parser.add_argument("--poles", type=int, default=2, help="Number of poles (2,4,6...). Default 2")
     parser.add_argument("--q", type=float, default=1.0 / math.sqrt(2.0), help="Quality factor Q (default 1/sqrt(2) )")
     parser.add_argument("--taps", type=int, default=513, help="Number of FIR taps (odd number recommended). Default 513")
@@ -202,7 +217,7 @@ def main(argv: Optional[list[str]] = None, *, data: Optional[np.ndarray] = None,
         fs, data = stereo_safe_read_wav(args.infile)
 
     # Apply filter using in-memory API
-    filtered = filter_signal(data, fs, args.type, args.freq, poles=args.poles, q=args.q, taps_count=args.taps)
+    filtered = filter_signal(data, fs, args.type, args.freq, poles=args.poles, q=args.q, taps_count=args.taps, freq2=args.freq2)
 
     # If CLI mode and outfile provided, write to disk and return 0
     if (data is None or fs is None) or args.outfile:

@@ -44,16 +44,18 @@ class MVSEPClient:
                     timeout=(600, 1200)
                 )
                 
-                # self._log_debug(f"Response status: {response.status_code}")
-                # self._log_debug(f"Response headers: {dict(response.headers)}")
+                self._log_debug(f"Response status: {response.status_code}")
+                self._log_debug(f"Response headers: {dict(response.headers)}")
                 
                 if response.status_code == 429:
                     retry_after = int(response.headers.get("Retry-After", self.retry_interval))
                     self._log_debug(f"Rate limited, retrying after {retry_after}s")
+                    response.close()
                     time.sleep(retry_after)
                     continue
                 if response.status_code == 400:
-                    #print(response)
+                    self._log_debug(f"Bad request (400), closing connection and retrying (attempt {attempt + 1}/{self.retries + 1})")
+                    response.close()
                     time.sleep(self.retry_interval)
                     continue
                 if 500 <= response.status_code < 600 and attempt < self.retries:
@@ -130,7 +132,7 @@ class MVSEPClient:
             params["api_token"] = self.api_key
         response = self._make_request("GET", "separation/get", params=params)
         json_response = response.json()
-        self._log_debug(f"Status response: {json_response}")
+        # self._log_debug(f"Status response: {json_response}")
         return json_response
 
     def download_track(self, url: str, output_path: str) -> None:

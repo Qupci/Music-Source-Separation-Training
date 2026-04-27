@@ -99,6 +99,17 @@ def average_waveforms(pred_track, weights, algorithm):
     pred_track = np.array(pred_track)
     final_length = pred_track.shape[-1]
 
+    # FFT-based min/max/median algorithms produce near-zero edge artifacts due
+    # to phase incoherence at signal boundaries after bin selection across
+    # different sources. Pad with reflected content so the artifacts land in the
+    # padding region, then trim back to the original length afterward.
+    pad_samples = 0
+    if algorithm in ['min_fft', 'max_fft', 'median_fft']:
+        pad_samples = 1024
+        # Reverse-mirror the last `pad_samples` samples onto the end
+        tail = pred_track[..., -pad_samples:][:, :, ::-1]
+        pred_track = np.concatenate([pred_track, tail], axis=-1)
+
     # Special case: single-item input where that single item is stereo
     # Treat the two channels as separate predictions (mono each) and
     # expect `weights` to match the number of channels (e.g. [1.0, 0.5]).
@@ -148,15 +159,20 @@ def average_waveforms(pred_track, weights, algorithm):
     elif algorithm in ['min_fft']:
         pred_track = np.array(pred_track)
         pred_track = lambda_min(pred_track, axis=0, key=np.abs)
-        pred_track = istft(pred_track, 1024, final_length)
+        pred_track = istft(pred_track, 1024, final_length + pad_samples)
     elif algorithm in ['max_fft']:
         pred_track = np.array(pred_track)
         pred_track = absmax(pred_track, axis=0)
-        pred_track = istft(pred_track, 1024, final_length)
+        pred_track = istft(pred_track, 1024, final_length + pad_samples)
     elif algorithm in ['median_fft']:
         pred_track = np.array(pred_track)
         pred_track = np.median(pred_track, axis=0)
-        pred_track = istft(pred_track, 1024, final_length)
+        pred_track = istft(pred_track, 1024, final_length + pad_samples)
+
+    # Trim padding added for edge-artifact mitigation
+    if pad_samples > 0:
+        pred_track = pred_track[..., :final_length]
+
     # If we came from the single-stereo-to-mono conversion, ensure output is mono
     if single_stereo_to_mono:
         # Many branches already produce shape (1, length); if output contains
