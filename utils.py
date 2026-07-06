@@ -94,6 +94,11 @@ def get_model_from_config(model_type: str, config_path: str) -> Tuple:
     elif model_type == 'bs_roformer':
         from models.bs_roformer import BSRoformer
         model = BSRoformer(**dict(config.model))
+    elif model_type == 'bs_roformer_ace':
+        # HyperACE variant of BS-Roformer (ships its own bs_roformer.py,
+        # vendored as models/bs_roformer/bs_roformer_ace.py)
+        from models.bs_roformer.bs_roformer_ace import BSRoformer as BSRoformerAce
+        model = BSRoformerAce(**dict(config.model))
     elif model_type == 'swin_upernet':
         from models.upernet_swin_transformers import Swin_UperNet_Model
         model = Swin_UperNet_Model(config)

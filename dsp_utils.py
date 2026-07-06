@@ -139,20 +139,6 @@ def inject_side_from_bs(side_file, target_inject_path):
         return None, None
 
 
-def choose_mvsep_send_input(iterative_folder, basename, iteration_target, mask, next_pass_path, input_path):
-    """Pick the best candidate file to send to MVSep: canonical pass file,
-    reconstructed next_pass, or fallback to original input."""
-    try:
-        canonical_candidate = os.path.join(iterative_folder, f'{basename}_pass{iteration_target}_{mask}.wav')
-        if os.path.exists(canonical_candidate):
-            return canonical_candidate
-        if next_pass_path and os.path.exists(next_pass_path):
-            return next_pass_path
-    except Exception:
-        pass
-    return input_path
-
-
 def find_model_output_for_file(store_dir, filename_stem, target_label='_other', name_maps=None):
     matches = []
 

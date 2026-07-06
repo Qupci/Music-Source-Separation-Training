@@ -1,11 +1,22 @@
-%cd '/content/Music-Source-Separation-Training/'
 import os
+import sys
 import time
+import shutil
 import threading
 import concurrent.futures
 from collections import deque, defaultdict
 
 import soundfile as sf
+
+# Works both as a Colab cell and as a plain local script:
+#   python "Cell-Iterative Method.py"
+IS_COLAB = 'google.colab' in sys.modules or os.path.exists('/content/Music-Source-Separation-Training')
+if IS_COLAB:
+    os.chdir('/content/Music-Source-Separation-Training')
+else:
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    if _script_dir:
+        os.chdir(_script_dir)
 
 from pipeline_config import PipelineConfig, NameMaps
 from audio_io import ensure_dirs, file_duration_seconds
@@ -13,16 +24,16 @@ from audio_normalize import (normalize_input_file, slugify_filename, shorten_slu
                              TARGET_SAMPLE_RATE, NORM_SUBDIR_NAME)
 from yaml_utils import register_yaml_constructors
 from model_data import ensure_model_ckpts
-from bitmask import mask_from_flags
+from bitmask import build_mask
 from dsp_utils import find_model_output_for_file
-from audio_io import is_audio_file_complete
 from filename_utils import strip_pass_prefixes
 from silence_detection import (_load_cut_info, _save_cut_info, _create_cut_file,
-                               _delete_previous_pass_files)
+                               _delete_previous_pass_files, DETECT_SUBDIR)
 from job_scheduling import (_schedule_local_job, _local_job_active,
-                            _snapshot_mvsep_futures, set_local_executor)
-from iterative_processing import process_single_song
-from finisher import process_finisher_stage, find_highest_processed_pass
+                            _snapshot_mvsep_futures, set_local_executor,
+                            get_auto_worker_count)
+from iterative_processing import process_single_song, find_resume_point, final_pass_output_path
+from finisher import process_finisher_stage
 
 
 # ----- User-configurable fields (Colab widgets can expose these) -----
@@ -30,20 +41,22 @@ from finisher import process_finisher_stage, find_highest_processed_pass
 #@markdown ### Main settings:
 input_folder = '/content/drive/MyDrive/input' #@param {type:"string"}
 output_folder = '/content/drive/MyDrive/output' #@param {type:"string"}
-export_format = 'wav FLOAT' #@param ['wav FLOAT', 'flac PCM_16', 'flac PCM_24']
+export_format = 'wav FLOAT' #@param ['wav FLOAT', 'wav PCM_24', 'wav PCM_16', 'flac PCM_16', 'flac PCM_24']
 overlap = 2
 normalization_preserve_48khz = False #@param {type:"boolean"}
 
-#@markdown ### MVSep API Token:
+#@markdown ### MVSep API Token (only needed when an MVSep model is enabled):
 mvsep_api_token = '' #@param {type:"string"}
 #@markdown ### MVSep no-credits handling:
 api_no_credits = True #@param {type:"boolean"}
 
 #@markdown ### Iterative stage:
-restore_side_iterative = True #@param {type:"boolean"}
-
 use_mel_v1e = True #@param {type:"boolean"}
 use_bs_resurrect = True #@param {type:"boolean"}
+use_mel_deux = False #@param {type:"boolean"}
+use_bs_leap = False #@param {type:"boolean"}
+use_mel_flowers = False #@param {type:"boolean"}
+use_bs_hyperace = False #@param {type:"boolean"}
 use_mvsep = False #@param {type:"boolean"}
 use_mvsep_scnet_becruily = True #@param {type:"boolean"}
 
@@ -53,8 +66,27 @@ post_separate_scnet = True #@param {type:"boolean"}
 #@markdown #### 2x Slowdown (additional separations, not replacements):
 use_2x_slowdown_mel_v1e = False #@param {type:"boolean"}
 use_2x_slowdown_bs_resurrect = True #@param {type:"boolean"}
+use_2x_slowdown_mel_deux = False #@param {type:"boolean"}
+use_2x_slowdown_bs_leap = False #@param {type:"boolean"}
+use_2x_slowdown_mel_flowers = False #@param {type:"boolean"}
+use_2x_slowdown_bs_hyperace = False #@param {type:"boolean"}
 use_2x_slowdown_mvsep = False #@param {type:"boolean"}
 use_2x_slowdown_mvsep_scnet_becruily = True #@param {type:"boolean"}
+
+#@markdown #### Middle-channel separations (extra separation of a downmixed input per model):
+use_mid_mel_v1e = False #@param {type:"boolean"}
+use_mid_bs_resurrect = False #@param {type:"boolean"}
+use_mid_mel_deux = False #@param {type:"boolean"}
+use_mid_bs_leap = False #@param {type:"boolean"}
+use_mid_mel_flowers = False #@param {type:"boolean"}
+use_mid_bs_hyperace = False #@param {type:"boolean"}
+use_mid_mvsep = False #@param {type:"boolean"}
+use_mid_mvsep_scnet_becruily = False #@param {type:"boolean"}
+
+#@markdown #### Side-channel restoration:
+restore_side_iterative = True #@param {type:"boolean"}
+iterative_side_method = 'simple' #@param ['simple', 'finisher']
+side_separation_model = 'bs_resurrect' #@param ['bs_resurrect', 'bs_hyperace', 'mel_deux', 'bs_leap']
 
 #@markdown #### Auto-trim (silence detection and removal):
 auto_trim_normalization = True #@param {type:"boolean"}
@@ -65,17 +97,22 @@ auto_trim_model_specific = True #@param {type:"boolean"}
 amplify_masked_details = True #@param {type:"boolean"}
 
 #@markdown ---
-#@markdown ### Finisher Variants:
+#@markdown ### Finisher Variants
+#@markdown Each variant is a model list (max_fft ensemble), either full-band
+#@markdown (e.g. `mvsep + bs_resurrect`) or split into bands
+#@markdown (e.g. `low: mvsep + bs_resurrect, high: mel_v1ep`).
+#@markdown Models: mvsep, bs_resurrect, mel_v1ep, bs_leap, mel_deux, bs_hyperace, mel_flowers.
 restore_side_variant = True #@param {type:"boolean"}
-
-variant_mvsep_only = True #@param {type:"boolean"}
-variant_mvsep_plus_resurrect = False #@param {type:"boolean"}
-variant_lp_mvsep_plus_lp_resurrect_plus_hp_v1ep = True #@param {type:"boolean"}
-variant_mvsep_plus_resurrect_plus_hp_v1ep = False #@param {type:"boolean"}
+finisher_variant_1 = 'mvsep' #@param {type:"string"}
+finisher_variant_2 = '' #@param {type:"string"}
+finisher_variant_3 = 'low: mvsep + bs_resurrect, high: mel_v1ep' #@param {type:"string"}
+finisher_variant_4 = '' #@param {type:"string"}
+finisher_split_hz = 6000 #@param {type:"integer"}
 
 #@markdown ### Experimental:
 iterations_amount = 4 #@param {type:"slider", min:1, max:5, step:1}
-worker_count = 3 #@param {type:"slider", min:1, max:8, step:1}
+#@markdown Worker count 0 = auto (sized from available VRAM).
+worker_count = 0 #@param {type:"slider", min:0, max:8, step:1}
 #@markdown #### Checkpoints:
 enable_gdrive_checkpoints = False #@param {type:"boolean"}
 gdrive_checkpoints_folder = '/content/drive/MyDrive/output/checkpoints' #@param {type:"string"}
@@ -83,46 +120,138 @@ dont_move_checkpoints = False #@param {type:"boolean"}
 #@markdown #### Delete previous pass folder after creating next pass:
 delete_previous_pass_folder = True #@param {type:"boolean"}
 
-# ckpt_root = '/content/drive/MyDrive/output/checkpoints' #@param {type:"string"}
 ckpt_root = '/content/checkpoints' #@param {type:"string"}
+
+
+def _localize_path(path, local_default):
+    """Swap Colab default paths for local ones when running outside Colab."""
+    if IS_COLAB:
+        return path
+    if path.startswith('/content'):
+        return local_default
+    return path
 
 
 def _build_config():
     return PipelineConfig(
-        input_folder=input_folder,
-        output_folder=output_folder,
+        input_folder=_localize_path(input_folder, os.path.join('.', 'input')),
+        output_folder=_localize_path(output_folder, os.path.join('.', 'output')),
         export_format=export_format,
         overlap=overlap,
         normalization_preserve_48khz=normalization_preserve_48khz,
         mvsep_api_token=mvsep_api_token,
         api_no_credits=api_no_credits,
-        restore_side_iterative=restore_side_iterative,
         use_mel_v1e=use_mel_v1e,
         use_bs_resurrect=use_bs_resurrect,
+        use_mel_deux=use_mel_deux,
+        use_bs_leap=use_bs_leap,
+        use_mel_flowers=use_mel_flowers,
+        use_bs_hyperace=use_bs_hyperace,
         use_mvsep=use_mvsep,
         use_mvsep_scnet_becruily=use_mvsep_scnet_becruily,
         post_separate_bs_resurrect=post_separate_bs_resurrect,
         post_separate_scnet=post_separate_scnet,
         use_2x_slowdown_mel_v1e=use_2x_slowdown_mel_v1e,
         use_2x_slowdown_bs_resurrect=use_2x_slowdown_bs_resurrect,
+        use_2x_slowdown_mel_deux=use_2x_slowdown_mel_deux,
+        use_2x_slowdown_bs_leap=use_2x_slowdown_bs_leap,
+        use_2x_slowdown_mel_flowers=use_2x_slowdown_mel_flowers,
+        use_2x_slowdown_bs_hyperace=use_2x_slowdown_bs_hyperace,
         use_2x_slowdown_mvsep=use_2x_slowdown_mvsep,
         use_2x_slowdown_mvsep_scnet_becruily=use_2x_slowdown_mvsep_scnet_becruily,
+        use_mid_mel_v1e=use_mid_mel_v1e,
+        use_mid_bs_resurrect=use_mid_bs_resurrect,
+        use_mid_mel_deux=use_mid_mel_deux,
+        use_mid_bs_leap=use_mid_bs_leap,
+        use_mid_mel_flowers=use_mid_mel_flowers,
+        use_mid_bs_hyperace=use_mid_bs_hyperace,
+        use_mid_mvsep=use_mid_mvsep,
+        use_mid_mvsep_scnet_becruily=use_mid_mvsep_scnet_becruily,
+        restore_side_iterative=restore_side_iterative,
+        iterative_side_method=iterative_side_method,
+        side_separation_model=side_separation_model,
         auto_trim_normalization=auto_trim_normalization,
         auto_trim_model_specific=auto_trim_model_specific,
         amplify_masked_details=amplify_masked_details,
         restore_side_variant=restore_side_variant,
-        variant_mvsep_only=variant_mvsep_only,
-        variant_mvsep_plus_resurrect=variant_mvsep_plus_resurrect,
-        variant_lp_mvsep_plus_lp_resurrect_plus_hp_v1ep=variant_lp_mvsep_plus_lp_resurrect_plus_hp_v1ep,
-        variant_mvsep_plus_resurrect_plus_hp_v1ep=variant_mvsep_plus_resurrect_plus_hp_v1ep,
+        finisher_variant_1=finisher_variant_1,
+        finisher_variant_2=finisher_variant_2,
+        finisher_variant_3=finisher_variant_3,
+        finisher_variant_4=finisher_variant_4,
+        finisher_split_hz=finisher_split_hz,
         iterations_amount=iterations_amount,
         worker_count=worker_count,
         enable_gdrive_checkpoints=enable_gdrive_checkpoints,
         gdrive_checkpoints_folder=gdrive_checkpoints_folder,
         dont_move_checkpoints=dont_move_checkpoints,
         delete_previous_pass_folder=delete_previous_pass_folder,
-        ckpt_root=ckpt_root,
+        ckpt_root=_localize_path(ckpt_root, os.path.join('.', 'checkpoints')),
     )
+
+
+def _merge_move_tree(src_root, dst_root):
+    """Move all files from src_root into dst_root, keeping existing ones."""
+    moved = 0
+    for dirpath, _dirnames, filenames in os.walk(src_root):
+        rel = os.path.relpath(dirpath, src_root)
+        target_dir = dst_root if rel == '.' else os.path.join(dst_root, rel)
+        ensure_dirs(target_dir)
+        for fname in filenames:
+            src = os.path.join(dirpath, fname)
+            dst = os.path.join(target_dir, fname)
+            if os.path.exists(dst):
+                continue
+            try:
+                shutil.move(src, dst)
+                moved += 1
+            except Exception as e:
+                print(f'Could not move checkpoint file {src}: {e}')
+    return moved
+
+
+def _apply_gdrive_checkpoints(cfg):
+    """When GDrive checkpoints are enabled, keep all working files on the
+    mounted Drive so a fresh Colab session can resume the process."""
+    if not cfg.enable_gdrive_checkpoints or not cfg.gdrive_checkpoints_folder:
+        return cfg
+    gdrive_root = cfg.gdrive_checkpoints_folder
+    ensure_dirs(gdrive_root)
+    local_root = os.path.abspath(cfg.ckpt_root)
+    if os.path.abspath(gdrive_root) != local_root:
+        if (not cfg.dont_move_checkpoints) and os.path.isdir(local_root):
+            moved = _merge_move_tree(local_root, gdrive_root)
+            if moved:
+                print(f'Moved {moved} checkpoint file(s) to GDrive: {gdrive_root}')
+        cfg.ckpt_root = gdrive_root
+        print(f'GDrive checkpoints enabled; working root: {gdrive_root}')
+    return cfg
+
+
+def _mvsep_duration_allows(entry, cfg):
+    """Check the MVSep 10-minute limit on the decoded working file.
+
+    Uses the cut (auto-trimmed) file when available, otherwise the normalized
+    file; doubles the duration when a 2x-slowdown MVSep separation is
+    selected, since the slowed upload is twice as long.
+    """
+    if not (cfg.api_no_credits and cfg.mvsep_needed()):
+        return True
+    path = entry.get('cut_path') or entry['normalized_path']
+    dur = file_duration_seconds(path)
+    if dur is None:
+        print(f'Could not determine duration for {path}; skipping due to api_no_credits policy')
+        return False
+    limit = 60 * 10
+    if dur > limit:
+        print(f'Skipping {entry["original"]}: working file is {dur:.1f}s '
+              f'(> {limit}s MVSep limit with api_no_credits)')
+        return False
+    mvsep_2x = (cfg.slowdown_enabled('mvsep') or cfg.slowdown_enabled('mvsep_scnet_becruily'))
+    if mvsep_2x and dur * 2 > limit:
+        print(f'Skipping {entry["original"]}: 2x-slowdown MVSep upload would be '
+              f'{dur * 2:.1f}s (> {limit}s MVSep limit). Disable 2x MVSep or trim the file.')
+        return False
+    return True
 
 
 def main():
@@ -130,41 +259,26 @@ def main():
     name_maps = NameMaps()
 
     register_yaml_constructors()
+    cfg = _apply_gdrive_checkpoints(cfg)
     os.makedirs(cfg.ckpt_root, exist_ok=True)
 
-    # Validate configuration: if MVSep is requested we require a token
+    # MVSep token is only required when an MVSep separation is requested.
     token_candidates = [tok.strip() for tok in cfg.mvsep_api_token.split() if tok.strip()]
-    if not token_candidates:
-        raise RuntimeError('MVSep API token is required when using MVSep.')
+    if cfg.mvsep_needed() and not token_candidates:
+        raise RuntimeError('MVSep API token is required when an MVSep model or '
+                           'MVSep finisher variant is enabled.')
 
     if cfg.api_no_credits:
         mvsep_tokens = token_candidates
     else:
         mvsep_tokens = token_candidates[:1]
-
-    primary_mvsep_token = mvsep_tokens[0]
+    primary_mvsep_token = mvsep_tokens[0] if mvsep_tokens else None
 
     ensure_model_ckpts(cfg)
-    supported_exts = ['.wav', '.flac', '.mp3', '.m4a']
+
+    supported_exts = ['.wav', '.flac', '.mp3', '.m4a', '.ogg', '.opus', '.aac']
     files = [os.path.join(cfg.input_folder, f) for f in os.listdir(cfg.input_folder)
              if os.path.splitext(f)[1].lower() in supported_exts]
-
-    if cfg.api_no_credits and (cfg.use_mvsep or cfg.use_mvsep_scnet_becruily):
-        filtered = []
-        for fp in files:
-            try:
-                dur = file_duration_seconds(fp)
-            except Exception:
-                dur = None
-            if dur is None:
-                print(f'Could not determine duration for {fp}; skipping due to api_no_credits policy')
-                continue
-            if dur > 60 * 10:
-                print(f"Skipping file (>{60*10}s) due to api_no_credits: {fp} (duration={dur:.1f}s)")
-                continue
-            filtered.append(fp)
-        files = filtered
-
     files.sort(key=lambda p: os.path.basename(p).lower())
 
     name_maps.clear_all()
@@ -175,14 +289,13 @@ def main():
         clean_base = strip_pass_prefixes(raw_base)
         slug = slugify_filename(clean_base)
         short = shorten_slug_words(slug)
-        entry = {
+        short_entries.append({
             'path': path,
             'raw_basename': raw_base,
             'original': clean_base,
             'slug': slug,
             'short': short,
-        }
-        short_entries.append(entry)
+        })
 
     grouped = defaultdict(list)
     for entry in short_entries:
@@ -243,17 +356,22 @@ def main():
 
     files = normalized_files
     short_entries = processed_entries
-    total_files = len(files)
 
-    if total_files == 0:
+    if not files:
         print('No inputs remain after normalization; aborting run.')
         return
 
-    print(f"Files found in input folder: {total_files} (normalized cache: {norm_dir})")
+    print(f"Files found in input folder: {len(files)} (normalized cache: {norm_dir})")
 
-    mvsep_max_workers = len(mvsep_tokens) if cfg.api_no_credits else None
+    if cfg.worker_count and cfg.worker_count > 0:
+        effective_workers = cfg.worker_count
+    else:
+        effective_workers = get_auto_worker_count()
+        print(f'Auto worker count from available VRAM: {effective_workers}')
+
+    mvsep_max_workers = max(1, len(mvsep_tokens)) if cfg.api_no_credits else None
     mvsep_executor = concurrent.futures.ThreadPoolExecutor(max_workers=mvsep_max_workers)
-    local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=cfg.worker_count) if cfg.worker_count else None
+    local_executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
     set_local_executor(local_executor)
     mvsep_state = {
         'executor': mvsep_executor,
@@ -267,10 +385,11 @@ def main():
         'mvsep_job_tokens': {},
         'mvsep_primary_token': primary_mvsep_token,
         'mvsep_tokens': mvsep_tokens,
+        'mvsep_disabled': set(),
     }
 
     # =========================================================================
-    # Stage: bs_largev1 Vocal Detection and Cut File Generation
+    # Stage: bs_resurrect Vocal Detection and Cut File Generation
     # =========================================================================
     cut_folder = os.path.join(cfg.ckpt_root, NORM_SUBDIR_NAME, 'cut')
     ensure_dirs(cut_folder)
@@ -279,10 +398,10 @@ def main():
         return find_model_output_for_file(store_dir, stem, label, name_maps)
 
     if cfg.auto_trim_normalization:
-        bs_largev1_detect_dir = os.path.join(cut_folder, 'bs_largev1_detect')
-        ensure_dirs(bs_largev1_detect_dir)
+        detect_dir = os.path.join(cut_folder, DETECT_SUBDIR)
+        ensure_dirs(detect_dir)
 
-        print('\n=== Stage: Vocal Detection (bs_largev1) ===')
+        print('\n=== Stage: Vocal Detection (bs_resurrect) ===')
 
         detection_pending = {}
         for entry in short_entries:
@@ -297,31 +416,27 @@ def main():
                 print(f'Cut file already exists for {short_name}')
                 continue
 
-            vocals_candidates = _find_model_output_fn(bs_largev1_detect_dir, short_name, '_vocals')
-            if vocals_candidates and is_audio_file_complete(vocals_candidates[0]):
-                cut_result = _create_cut_file(norm_path, cut_folder, short_name, _find_model_output_fn)
-                if cut_result:
-                    entry['cut_path'] = cut_result
-                    entry['cut_info'] = _load_cut_info(cut_folder, short_name)
+            cut_result = _create_cut_file(norm_path, cut_folder, short_name,
+                                          _find_model_output_fn, cfg)
+            if cut_result:
+                entry['cut_path'] = cut_result
+                entry['cut_info'] = _load_cut_info(cut_folder, short_name)
                 continue
 
-            job_key = ('bs_largev1_detect', short_name)
-            fut = _schedule_local_job(mvsep_state, job_key, 'bs_largev1', norm_path,
-                                      bs_largev1_detect_dir, cfg, name_maps, short_name)
-            detection_pending[short_name] = {
-                'entry': entry,
-                'norm_path': norm_path,
-                'future': fut,
-            }
+            job_key = ('detect_bs_resurrect', short_name)
+            _schedule_local_job(mvsep_state, job_key, 'bs_resurrect', norm_path,
+                                detect_dir, cfg, name_maps, short_name)
+            detection_pending[short_name] = {'entry': entry, 'norm_path': norm_path}
 
         if detection_pending:
-            print(f'Running bs_largev1 vocal detection on {len(detection_pending)} files...')
+            print(f'Running bs_resurrect vocal detection on {len(detection_pending)} files...')
             while detection_pending:
                 completed = []
                 for short_name, info in detection_pending.items():
-                    job_key = ('bs_largev1_detect', short_name)
+                    job_key = ('detect_bs_resurrect', short_name)
                     if not _local_job_active(mvsep_state, job_key):
-                        cut_result = _create_cut_file(info['norm_path'], cut_folder, short_name, _find_model_output_fn)
+                        cut_result = _create_cut_file(info['norm_path'], cut_folder, short_name,
+                                                      _find_model_output_fn, cfg)
                         if cut_result:
                             info['entry']['cut_path'] = cut_result
                             info['entry']['cut_info'] = _load_cut_info(cut_folder, short_name)
@@ -353,6 +468,7 @@ def main():
                         'base_vocal_regions': [],
                         'was_cut': False,
                         'sample_rate': orig_sr,
+                        'pass_model_silences': {},
                         'model_silences': {},
                     }
                     _save_cut_info(cut_folder, short_name, minimal_cut_info)
@@ -361,48 +477,32 @@ def main():
                     entry['cut_info'] = existing
         print('\nNormalization-stage auto-trim disabled, using normalized files directly.')
 
+    # MVSep duration policy: check decoded working files (post cut), account
+    # for the 2x slowdown length, and skip early instead of looping later.
+    if cfg.api_no_credits and cfg.mvsep_needed():
+        kept = [e for e in short_entries if _mvsep_duration_allows(e, cfg)]
+        short_entries = kept
+
     cut_files = []
     for entry in short_entries:
-        if cfg.auto_trim_normalization and 'cut_path' in entry and entry.get('cut_path'):
+        if cfg.auto_trim_normalization and entry.get('cut_path'):
             cut_files.append(entry['cut_path'])
             name_maps.file_short_info[entry['cut_path']] = entry
         else:
             cut_files.append(entry['normalized_path'])
 
-    mask = mask_from_flags(
-        cfg.amplify_masked_details,
-        cfg.use_2x_slowdown_mel_v1e,
-        cfg.use_2x_slowdown_bs_resurrect,
-        cfg.use_2x_slowdown_mvsep,
-        cfg.use_2x_slowdown_mvsep_scnet_becruily,
-        cfg.post_separate_bs_resurrect,
-        cfg.post_separate_scnet,
-        cfg.restore_side_iterative,
-        cfg.use_mel_v1e,
-        cfg.use_bs_resurrect,
-        cfg.use_mvsep,
-        cfg.use_mvsep_scnet_becruily,
-    )
+    total_files = len(cut_files)
+    if total_files == 0:
+        print('No inputs remain after duration checks; aborting run.')
+        return
 
-    enabled_finisher_variants = []
-    if cfg.variant_mvsep_only:
-        enabled_finisher_variants.append('mvsep_only')
-    if cfg.variant_mvsep_plus_resurrect:
-        enabled_finisher_variants.append('maxfft(bs_mvsep+bs_resurrect)')
-    if cfg.variant_lp_mvsep_plus_lp_resurrect_plus_hp_v1ep:
-        enabled_finisher_variants.append('maxfft(lp(bs_mvsep)+lp(bs_resurrect))+hp(mel_v1e+)')
-    if cfg.variant_mvsep_plus_resurrect_plus_hp_v1ep:
-        enabled_finisher_variants.append('maxfft(bs_mvsep+bs_resurrect+hp(mel_v1e+))')
-
+    mask = build_mask(cfg)
+    enabled_finisher_variants = cfg.parsed_finisher_variants()
     finisher_work_required = bool(enabled_finisher_variants)
+    if finisher_work_required:
+        print('Finisher variants:', ', '.join(v['name'] for v in enabled_finisher_variants))
     finisher_root = os.path.join(cfg.ckpt_root, 'finisher', f'pass{cfg.iterations_amount}_{mask}')
     ensure_dirs(finisher_root)
-
-    resume_info = {}
-    for idx, f in enumerate(cut_files):
-        entry = short_entries[idx]
-        short_basename = entry['short']
-        resume_info[f] = find_highest_processed_pass(short_basename, mask, cfg, name_maps)
 
     file_indices = {f: idx for idx, f in enumerate(cut_files, 1)}
     started_files = set()
@@ -414,31 +514,34 @@ def main():
         original_basename = entry['original']
         norm_path = entry['normalized_path']
         cut_info = entry.get('cut_info')
-        found_pass, canonical_input = resume_info.get(f, (0, None))
 
-        if found_pass == 0:
-            queue.append({
-                'stage': 'iterative',
-                'orig': f,
-                'norm_path': norm_path,
-                'cut_info': cut_info,
-                'current_input': f,
-                'pass': 1,
-                'short_basename': short_basename,
-                'original_basename': original_basename,
-            })
-        else:
-            next_pass_num = found_pass + 1 if found_pass < cfg.iterations_amount else cfg.iterations_amount
-            queue.append({
-                'stage': 'iterative',
-                'orig': f,
-                'norm_path': norm_path,
-                'cut_info': cut_info,
-                'current_input': canonical_input or f,
-                'pass': next_pass_num,
-                'short_basename': short_basename,
-                'original_basename': original_basename,
-            })
+        resume_pass, resume_input, final_done = find_resume_point(short_basename, mask, cfg)
+        base_item = {
+            'orig': f,
+            'norm_path': norm_path,
+            'cut_info': cut_info,
+            'short_basename': short_basename,
+            'original_basename': original_basename,
+        }
+        if final_done:
+            print(f'Final pass already complete for {original_basename}; resuming at finisher')
+            if finisher_work_required:
+                queue.append({
+                    **base_item,
+                    'stage': 'finisher',
+                    'final_pass_path': final_pass_output_path(short_basename, mask, cfg),
+                    'wait_start': time.time(),
+                    'wait_timeout': 60 * 30,
+                })
+            continue
+        if resume_pass > 1:
+            print(f'Resuming {original_basename} at pass {resume_pass}')
+        queue.append({
+            **base_item,
+            'stage': 'iterative',
+            'current_input': resume_input or f,
+            'pass': resume_pass,
+        })
 
     while queue:
         item = queue.popleft()
@@ -482,23 +585,17 @@ def main():
 
             if cur_pass < cfg.iterations_amount:
                 queue.append({
+                    **{k: item[k] for k in ('orig', 'norm_path', 'cut_info',
+                                            'short_basename', 'original_basename')},
                     'stage': 'iterative',
-                    'orig': f_orig,
-                    'norm_path': norm_path,
-                    'cut_info': cut_info,
                     'current_input': next_pass,
                     'pass': cur_pass + 1,
-                    'short_basename': short_basename,
-                    'original_basename': original_basename,
                 })
             elif finisher_work_required:
                 queue.append({
+                    **{k: item[k] for k in ('orig', 'norm_path', 'cut_info',
+                                            'short_basename', 'original_basename')},
                     'stage': 'finisher',
-                    'orig': f_orig,
-                    'norm_path': norm_path,
-                    'cut_info': cut_info,
-                    'short_basename': short_basename,
-                    'original_basename': original_basename,
                     'final_pass_path': next_pass,
                     'wait_start': time.time(),
                     'wait_timeout': 60 * 30,

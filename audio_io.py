@@ -77,11 +77,22 @@ def _ensure_audio_channels(data, target_channels):
     return np.vstack([data, extras])
 
 
+def _model_suffixes():
+    try:
+        from model_data import ITERATIVE_MODEL_KEYS
+        keys = list(ITERATIVE_MODEL_KEYS)
+    except Exception:
+        keys = ['bs_resurrect', 'mel_v1e', 'mvsep', 'mvsep_scnet_becruily']
+    suffixes = []
+    for key in keys:
+        suffixes.extend([f'_{key}', f'_2x_{key}', f'_mid_{key}'])
+    # Longest first so e.g. _mvsep_scnet_becruily wins over _mvsep
+    return sorted(suffixes, key=len, reverse=True)
+
+
 def _strip_model_suffix(name):
-    """Strip model-specific suffixes like _bs_resurrect, _mel_v1e from a filename."""
-    model_suffixes = ['_bs_resurrect', '_mel_v1e', '_mvsep', '_mvsep_scnet_becruily',
-                      '_2x_bs_resurrect', '_2x_mel_v1e', '_2x_mvsep', '_2x_mvsep_scnet_becruily']
-    for suffix in model_suffixes:
+    """Strip model-specific suffixes like _bs_resurrect, _2x_mel_v1e from a filename."""
+    for suffix in _model_suffixes():
         if name.endswith(suffix):
             return name[:-len(suffix)]
     return name

@@ -136,18 +136,33 @@ class MVSEPClient:
         return json_response
 
     def download_track(self, url: str, output_path: str) -> None:
-        """Download a track directly using the full URL from the API response"""
+        """Download a track directly using the full URL from the API response.
+
+        Streams to a temporary '.part' file and atomically renames it once the
+        download is complete, so consumers scanning the output directory can
+        never pick up a half-written audio file.
+        """
         self._log_debug(f"Downloading track directly from {url}")
-        
+
         # Bypass the base URL since we have full download URLs
         response = requests.get(url, stream=True, headers=self.headers)
         response.raise_for_status()
-        
+
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+        tmp_path = output_path + ".part"
+        try:
+            with open(tmp_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(tmp_path, output_path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
         self._log_debug(f"Finished downloading to {output_path}")
 
 

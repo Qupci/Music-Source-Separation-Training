@@ -61,8 +61,13 @@ def _linear_resample(data, orig_sr, target_sr):
 
 
 def _resample_audio(data, orig_sr, target_sr):
+    """Resample with SciPy's FFT resampler (same engine as the slowdown
+    script); polyphase and linear interpolation only remain as fallbacks."""
     if orig_sr == target_sr:
         return data
+    if _scipy_resample is not None:
+        target_len = max(1, int(round(data.shape[0] * float(target_sr) / float(orig_sr))))
+        return _scipy_resample(data, target_len, axis=0).astype(np.float32)
     if _scipy_resample_poly is not None:
         up = int(target_sr)
         down = int(orig_sr)
@@ -70,9 +75,6 @@ def _resample_audio(data, orig_sr, target_sr):
         up //= gcd_val or 1
         down //= gcd_val or 1
         return _scipy_resample_poly(data, up, down, axis=0).astype(np.float32)
-    if _scipy_resample is not None:
-        target_len = max(1, int(round(data.shape[0] * float(target_sr) / float(orig_sr))))
-        return _scipy_resample(data, target_len, axis=0).astype(np.float32)
     return _linear_resample(data, orig_sr, target_sr).astype(np.float32)
 
 
@@ -95,23 +97,70 @@ def _select_wav_subtype(preferred, fallback='FLOAT'):
     return sorted(WAV_AVAILABLE_SUBTYPES)[0] if WAV_AVAILABLE_SUBTYPES else 'FLOAT'
 
 
-def normalize_input_file(src_path, dest_path, cfg, target_sr=TARGET_SAMPLE_RATE, target_channels=TARGET_CHANNELS):
+def _decode_any_audio(src_path):
+    """Decode an audio file to (data (samples, channels) float32, sr, subtype).
+
+    soundfile handles wav/flac/most mp3; lossy formats it cannot decode
+    (e.g. m4a/aac) fall back to librosa/audioread.
+    """
+    subtype = None
     try:
         info = sf.info(src_path)
-    except Exception as exc:
-        print(f'Failed to inspect {src_path}: {exc}')
-        return None
+        subtype = getattr(info, 'subtype', None)
+    except Exception:
+        info = None
     try:
         data, sr = sf.read(src_path, dtype='float32', always_2d=True)
+        return np.asarray(data, dtype=np.float32), int(sr), subtype
     except Exception as exc:
-        print(f'Failed to read {src_path}: {exc}')
+        print(f'soundfile could not decode {src_path} ({exc}); trying librosa fallback')
+    try:
+        import librosa
+        data, sr = librosa.load(src_path, sr=None, mono=False)
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
+        else:
+            data = data.T  # librosa returns (channels, samples)
+        return data, int(sr), None
+    except Exception as exc:
+        print(f'Failed to decode {src_path}: {exc}')
+        return None, None, None
+
+
+def normalize_input_file(src_path, dest_path, cfg, target_sr=TARGET_SAMPLE_RATE, target_channels=TARGET_CHANNELS):
+    if os.path.exists(dest_path):
+        # Reuse an existing normalized file (resume support): report its
+        # properties without re-decoding the source.
+        try:
+            existing = sf.info(dest_path)
+            if getattr(existing, 'frames', 0) > 0:
+                orig_sr_guess = None
+                try:
+                    orig_sr_guess = int(getattr(sf.info(src_path), 'samplerate', 0)) or None
+                except Exception:
+                    pass
+                return {
+                    'sample_rate': int(existing.samplerate),
+                    'original_sample_rate': int(orig_sr_guess or existing.samplerate),
+                    'subtype': getattr(existing, 'subtype', 'FLOAT'),
+                    'resampled': bool(orig_sr_guess and orig_sr_guess != int(existing.samplerate)),
+                    'channel_mode': 'cached',
+                    'kept_bit_depth': False,
+                    'preserve_48k': bool(cfg.normalization_preserve_48khz and orig_sr_guess == 48000),
+                }
+        except Exception:
+            pass
+
+    data, sr, src_subtype = _decode_any_audio(src_path)
+    if data is None:
         return None
 
-    data = np.asarray(data, dtype=np.float32)
     if data.ndim != 2:
         data = np.reshape(data, (-1, 1))
 
-    original_sr = int(getattr(info, 'samplerate', sr) or sr or target_sr)
+    original_sr = int(sr or target_sr)
+    info = type('Info', (), {'subtype': src_subtype})()
     original_channels = data.shape[1]
 
     preserve_48k = cfg.normalization_preserve_48khz and int(original_sr) == 48000

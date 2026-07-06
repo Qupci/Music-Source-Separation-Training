@@ -3,18 +3,23 @@ import json
 import shutil
 import numpy as np
 
-from audio_io import read_wav_float, write_wav_float_atomic, ensure_dirs
+from audio_io import read_wav_float, write_wav_float_atomic, ensure_dirs, _ensure_audio_channels
 from audio_normalize import slugify_filename
 from bitmask import compute_effective_mask
+from ensemble import average_waveforms
 
 
 # RMS silence detection constants
 SILENCE_THRESHOLD_DB = -105.0
+# Threshold used when analyzing RAW (non post-processed) separation results:
+# raw outputs keep a residual noise floor, so "silence" sits far above -105 dB.
+RAW_SILENCE_THRESHOLD_DB = -38.0
 SILENCE_WINDOW_SIZE = 4096
 SILENCE_HOP_SIZE = 1024
 
-# Global storage for cut file info and model-specific silence data
-CUT_FILE_INFO = {}  # short_basename -> {'base_silence_ranges': [...], 'model_silences': {'model_key': [...]}, ...}
+# Ensemble regions shorter than this many samples get avg_wave instead of
+# max_fft (FFT ensembling needs enough context to be meaningful).
+MIN_FFT_REGION_SAMPLES = 3113
 
 
 def _db_to_linear(db):
@@ -193,28 +198,6 @@ def _restore_with_vocal_regions(processed_audio, original_audio, vocal_regions):
     return result
 
 
-def _silence_regions_in_audio(audio, silence_regions):
-    """Zero out (silence) the specified regions in audio.
-
-    Args:
-        audio: Audio data (channels, samples)
-        silence_regions: List of (start_sample, end_sample) tuples to silence
-
-    Returns:
-        Audio with specified regions silenced (zeroed)
-    """
-    result = audio.copy()
-
-    if result.ndim == 1:
-        for start, end in silence_regions:
-            result[start:end] = 0.0
-    else:
-        for start, end in silence_regions:
-            result[:, start:end] = 0.0
-
-    return result
-
-
 def _insert_silence_at_regions(audio, silence_regions, original_length):
     """Insert silence back into audio at the specified regions.
 
@@ -263,6 +246,21 @@ def _insert_silence_at_regions(audio, silence_regions, original_length):
     return result
 
 
+def _merge_regions(regions):
+    """Merge overlapping/adjacent (start, end) regions."""
+    cleaned = sorted((int(s), int(e)) for s, e in regions if int(e) > int(s))
+    if not cleaned:
+        return []
+    merged = [cleaned[0]]
+    for start, end in cleaned[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _compute_overlapping_silence(silence_dict):
     """Compute overlapping silence ranges across all models.
 
@@ -280,7 +278,7 @@ def _compute_overlapping_silence(silence_dict):
         return []
 
     if len(model_keys) == 1:
-        return silence_dict[model_keys[0]]
+        return _merge_regions(silence_dict[model_keys[0]])
 
     # Start with first model's ranges
     result = list(silence_dict[model_keys[0]])
@@ -300,19 +298,108 @@ def _compute_overlapping_silence(silence_dict):
         if not result:
             break
 
-    # Merge adjacent/overlapping ranges
-    if result:
-        result = sorted(result, key=lambda x: x[0])
-        merged = [result[0]]
-        for start, end in result[1:]:
-            last_start, last_end = merged[-1]
-            if start <= last_end:
-                merged[-1] = (last_start, max(last_end, end))
-            else:
-                merged.append((start, end))
-        result = merged
+    return _merge_regions(result)
 
-    return result
+
+# =========================================================================
+# Region-stitched ensemble (artifact-free replacement for silence insertion)
+# =========================================================================
+
+def _region_covers(regions, start, end):
+    """True when [start, end) lies fully inside one of the regions."""
+    for s, e in regions:
+        if s <= start and end <= e:
+            return True
+    return False
+
+
+def stitched_ensemble(waves_by_key, silence_map, target_len, fallback_signal,
+                      algorithm='max_fft', min_region_samples=MIN_FFT_REGION_SAMPLES):
+    """Ensemble model results region-by-region, excluding silent models.
+
+    Instead of inserting silence (or filler) into a model's result and running
+    one global ensemble (which produces amplitude spikes at silence
+    boundaries), the timeline is partitioned at every silence-region boundary
+    and each segment is ensembled only from the models that are NOT silent
+    there. Segments where every model is silent are copied from
+    fallback_signal (the current pass input). Segments shorter than
+    min_region_samples use avg_wave instead of FFT-based ensembling.
+
+    Args:
+        waves_by_key: dict model_key -> np.ndarray (channels, target_len)
+        silence_map: dict model_key -> list of (start, end) exclusion regions
+        target_len: total output length in samples
+        fallback_signal: (channels, target_len) used where all models are excluded
+        algorithm: ensemble algorithm for normal-size segments
+
+    Returns:
+        np.ndarray (channels, target_len)
+    """
+    keys = [k for k, w in waves_by_key.items() if isinstance(w, np.ndarray) and w.size]
+    if not keys:
+        if fallback_signal is not None:
+            return np.array(fallback_signal[:, :target_len], copy=True)
+        return np.zeros((2, target_len), dtype=np.float32)
+
+    n_ch = min(2, max(waves_by_key[k].shape[0] for k in keys))
+    aligned = {}
+    clean_map = {}
+    for k in keys:
+        w = _ensure_audio_channels(waves_by_key[k], n_ch)
+        if w.shape[1] < target_len:
+            w = np.pad(w, ((0, 0), (0, target_len - w.shape[1])), mode='constant')
+        elif w.shape[1] > target_len:
+            w = w[:, :target_len]
+        aligned[k] = w
+        regions = _merge_regions(silence_map.get(k, []) or [])
+        clean_map[k] = [(max(0, s), min(target_len, e)) for s, e in regions
+                        if min(target_len, e) > max(0, s)]
+
+    fallback = None
+    if fallback_signal is not None:
+        fallback = _ensure_audio_channels(np.asarray(fallback_signal), n_ch)
+        if fallback.shape[1] < target_len:
+            fallback = np.pad(fallback, ((0, 0), (0, target_len - fallback.shape[1])), mode='constant')
+
+    # Fast path: nothing to exclude -> single global ensemble
+    if not any(clean_map[k] for k in keys):
+        waves = [aligned[k] for k in keys]
+        if len(waves) == 1:
+            return waves[0]
+        return average_waveforms(waves, [1.0] * len(waves), algorithm)
+
+    boundaries = {0, target_len}
+    for k in keys:
+        for s, e in clean_map[k]:
+            boundaries.add(s)
+            boundaries.add(e)
+    boundaries = sorted(boundaries)
+
+    out = np.zeros((n_ch, target_len), dtype=np.float32)
+    for seg_start, seg_end in zip(boundaries[:-1], boundaries[1:]):
+        if seg_end <= seg_start:
+            continue
+        active = [aligned[k][:, seg_start:seg_end] for k in keys
+                  if not _region_covers(clean_map[k], seg_start, seg_end)]
+        seg_len = seg_end - seg_start
+        if not active:
+            if fallback is not None:
+                out[:, seg_start:seg_end] = fallback[:, seg_start:seg_end]
+            continue
+        if len(active) == 1:
+            out[:, seg_start:seg_end] = active[0]
+            continue
+        seg_algorithm = algorithm
+        if seg_len < min_region_samples and algorithm.endswith('_fft'):
+            seg_algorithm = 'avg_wave'
+        try:
+            seg_res = average_waveforms(active, [1.0] * len(active), seg_algorithm)
+        except Exception:
+            seg_res = np.mean(np.stack(active, axis=0), axis=0)
+        if seg_res.ndim == 1:
+            seg_res = np.expand_dims(seg_res, 0)
+        out[:, seg_start:seg_end] = _ensure_audio_channels(seg_res, n_ch)[:, :seg_len]
+    return out
 
 
 # =========================================================================
@@ -347,31 +434,87 @@ def _save_cut_info(cut_folder, short_basename, cut_info):
         print(f'Failed to save cut info to {json_path}: {e}')
 
 
-def _update_cut_info_model_silence(cut_folder, short_basename, model_key, silence_regions):
-    """Update cut info with model-specific silence regions (2nd layer)."""
+def _get_pass_silences(cut_info, pass_n):
+    """Silence regions detected at a specific pass: model_key -> [(s, e), ...]."""
+    if not cut_info:
+        return {}
+    per_pass = cut_info.get('pass_model_silences', {}) or {}
+    result = {}
+    for model_key, regions in (per_pass.get(str(pass_n), {}) or {}).items():
+        result[model_key] = [tuple(r) for r in regions]
+    return result
+
+
+def _get_cumulative_silences(cut_info, model_key, upto_pass):
+    """Union of a model's silence regions detected at passes 1..upto_pass."""
+    if not cut_info:
+        return []
+    per_pass = cut_info.get('pass_model_silences', {}) or {}
+    regions = []
+    for p in range(1, upto_pass + 1):
+        regions.extend(tuple(r) for r in (per_pass.get(str(p), {}) or {}).get(model_key, []))
+    #
+
+    legacy = (cut_info.get('model_silences', {}) or {}).get(model_key)
+    if legacy and not per_pass:
+        regions.extend(tuple(r) for r in legacy)
+    return _merge_regions(regions)
+
+
+def _update_cut_info_model_silence(cut_folder, short_basename, model_key,
+                                   silence_regions, pass_n=1):
+    """Record model-specific silence regions detected at a given pass."""
     cut_info = _load_cut_info(cut_folder, short_basename) or {}
-    model_silences = cut_info.setdefault('model_silences', {})
-    # Convert tuples to lists for JSON serialization
-    model_silences[model_key] = [[s, e] for s, e in silence_regions]
+    per_pass = cut_info.setdefault('pass_model_silences', {})
+    pass_map = per_pass.setdefault(str(pass_n), {})
+    pass_map[model_key] = [[int(s), int(e)] for s, e in silence_regions]
+    # Keep the legacy union map updated for any consumers of 'model_silences'.
+    union = _get_cumulative_silences(cut_info, model_key, pass_n)
+    cut_info.setdefault('model_silences', {})[model_key] = [[s, e] for s, e in union]
     _save_cut_info(cut_folder, short_basename, cut_info)
     return cut_info
 
 
-def _create_cut_file(norm_path, cut_folder, short_basename, find_model_output_fn):
+# =========================================================================
+# Detection stage (bs_resurrect based)
+# =========================================================================
+
+DETECT_SUBDIR = 'detect_bs_resurrect'
+
+
+def _detection_threshold(cfg):
+    """Threshold rule for the bs_resurrect detection stage: post-processed
+    results keep the standard threshold, raw results use -38 dB."""
+    if cfg.post_separate_bs_resurrect:
+        return SILENCE_THRESHOLD_DB
+    return RAW_SILENCE_THRESHOLD_DB
+
+
+def find_detection_instrumental(cut_folder, short_basename, find_model_output_fn, cfg):
+    """Locate the bs_resurrect detection-stage instrumental output."""
+    detect_dir = os.path.join(cut_folder, DETECT_SUBDIR)
+    if cfg.post_separate_bs_resurrect:
+        found = find_model_output_fn(detect_dir, short_basename, '_other_pp')
+        if found:
+            return found[0], True
+        # pp not (yet) present: fall through to raw only if pp is disabled
+        return None, False
+    found = find_model_output_fn(detect_dir, short_basename, '_other')
+    found = [p for p in found if not p.endswith('_pp.wav')]
+    if found:
+        return found[0], False
+    return None, False
+
+
+def _create_cut_file(norm_path, cut_folder, short_basename, find_model_output_fn, cfg):
     """Create a cut (shortened) version of the normalized file.
 
-    This function should be called after bs_largev1 vocal detection has run.
-    It reads the vocal output, detects silence, and creates a cut file containing
-    only the vocal sections.
-
-    Args:
-        norm_path: Path to normalized audio file
-        cut_folder: Folder for cut files
-        short_basename: Short basename for the file
-        find_model_output_fn: Callable(store_dir, stem, label) to find model outputs
+    Called after the bs_resurrect detection separation has run. Vocals are
+    obtained by phase-invert mixing the instrumental result with the
+    normalized input; silence in those vocals defines the removable regions.
 
     Returns:
-        Path to cut file, or None if no cutting needed or error
+        Path to cut file, or None if not ready / error
     """
     cut_path = os.path.join(cut_folder, f'{short_basename}.wav')
 
@@ -381,46 +524,50 @@ def _create_cut_file(norm_path, cut_folder, short_basename, find_model_output_fn
         if cut_info and 'base_vocal_regions' in cut_info:
             return cut_path
 
-    # Load the normalized file
+    inst_path, is_pp = find_detection_instrumental(cut_folder, short_basename,
+                                                   find_model_output_fn, cfg)
+    if not inst_path:
+        print(f'No detection instrumental found for {short_basename}, cannot create cut file')
+        return None
+
     try:
         audio, sr = read_wav_float(norm_path)
+        inst, _ = read_wav_float(inst_path)
     except Exception as e:
-        print(f'Failed to read normalized file for cutting: {e}')
+        print(f'Failed to read files for cutting: {e}')
         return None
 
-    # Load the vocals file from bs_largev1 detection
-    bs_largev1_dir = os.path.join(cut_folder, 'bs_largev1_detect')
-    vocals_candidates = find_model_output_fn(bs_largev1_dir, short_basename, '_vocals')
+    if audio.ndim == 1:
+        audio = np.expand_dims(audio, 0)
+    if inst.ndim == 1:
+        inst = np.expand_dims(inst, 0)
+    inst = _ensure_audio_channels(inst, audio.shape[0])
+    original_length = audio.shape[1]
+    if inst.shape[1] < original_length:
+        inst = np.pad(inst, ((0, 0), (0, original_length - inst.shape[1])), mode='constant')
+    vocals = audio - inst[:, :original_length]
 
-    if not vocals_candidates:
-        print(f'No bs_largev1 vocals found for {short_basename}, cannot create cut file')
-        return None
-
-    try:
-        vocals, _ = read_wav_float(vocals_candidates[0])
-    except Exception as e:
-        print(f'Failed to read vocals file for silence detection: {e}')
-        return None
+    threshold_db = SILENCE_THRESHOLD_DB if is_pp else RAW_SILENCE_THRESHOLD_DB
 
     # Detect vocal regions (non-silence)
-    vocal_regions = _detect_vocal_regions(vocals, sr, SILENCE_THRESHOLD_DB,
+    vocal_regions = _detect_vocal_regions(vocals, sr, threshold_db,
                                           SILENCE_WINDOW_SIZE, SILENCE_HOP_SIZE)
 
     if not vocal_regions:
         print(f'No vocal regions detected for {short_basename}, keeping full file')
         # Save info that file wasn't cut
         cut_info = {
-            'original_length': audio.shape[1] if audio.ndim == 2 else len(audio),
+            'original_length': original_length,
             'base_vocal_regions': [],
             'was_cut': False,
             'sample_rate': sr,
+            'pass_model_silences': {},
+            'model_silences': {},
         }
         _save_cut_info(cut_folder, short_basename, cut_info)
         # Copy the original file as-is
         shutil.copy(norm_path, cut_path)
         return cut_path
-
-    original_length = audio.shape[1] if audio.ndim == 2 else len(audio)
 
     # Check if cutting would actually save anything significant
     total_vocal_samples = sum(end - start for start, end in vocal_regions)
@@ -431,6 +578,8 @@ def _create_cut_file(norm_path, cut_folder, short_basename, find_model_output_fn
             'base_vocal_regions': [[s, e] for s, e in vocal_regions],
             'was_cut': False,
             'sample_rate': sr,
+            'pass_model_silences': {},
+            'model_silences': {},
         }
         _save_cut_info(cut_folder, short_basename, cut_info)
         shutil.copy(norm_path, cut_path)
@@ -446,7 +595,8 @@ def _create_cut_file(norm_path, cut_folder, short_basename, find_model_output_fn
         'was_cut': True,
         'cut_length': cut_audio.shape[1] if cut_audio.ndim == 2 else len(cut_audio),
         'sample_rate': sr,
-        'model_silences': {},  # Will be populated by iterative stage
+        'pass_model_silences': {},
+        'model_silences': {},  # legacy union map, populated per pass
     }
     _save_cut_info(cut_folder, short_basename, cut_info)
 
@@ -520,8 +670,15 @@ def _delete_previous_pass_files(prev_pass_num, mask, short_basename, cfg, name_m
             print(f'Deleted {deleted_count} file(s) for "{short_basename}" from {prev_folder} (cleanup note: {e})')
 
 
-def _analyze_model_result_for_silence(input_audio, result_audio, sr, model_key, cut_folder, short_basename):
-    """Analyze a model's result to detect additional silence."""
+def _analyze_model_result_for_silence(input_audio, result_audio, sr, model_key,
+                                      cut_folder, short_basename, pass_n=1,
+                                      threshold_db=SILENCE_THRESHOLD_DB):
+    """Analyze a model's result to detect regions with no vocal content.
+
+    Vocals are obtained by phase-invert mixing the instrumental result with
+    the model's input; regions where those vocals are silent are recorded for
+    the given pass so the ensemble can exclude the model there.
+    """
     # Ensure same shape
     if input_audio.ndim == 1:
         input_audio = np.expand_dims(input_audio, 0)
@@ -536,26 +693,15 @@ def _analyze_model_result_for_silence(input_audio, result_audio, sr, model_key, 
     vocals = input_cut - result_cut
 
     # Detect silence in the vocals
-    silence_regions = _detect_silence_regions(vocals, sr, SILENCE_THRESHOLD_DB,
+    silence_regions = _detect_silence_regions(vocals, sr, threshold_db,
                                               SILENCE_WINDOW_SIZE, SILENCE_HOP_SIZE)
 
-    # Update the cut info JSON with this model's silence
+    # Update the cut info JSON with this model's silence for this pass
     if silence_regions:
-        _update_cut_info_model_silence(cut_folder, short_basename, model_key, silence_regions)
+        _update_cut_info_model_silence(cut_folder, short_basename, model_key,
+                                       silence_regions, pass_n=pass_n)
 
     return silence_regions
-
-
-def _create_model_cut_result(result_audio, silence_regions, output_path, sr):
-    """Create a _cut version of a model result with silence regions zeroed out."""
-    if not silence_regions:
-        # No silence to apply, just copy
-        write_wav_float_atomic(output_path, result_audio, sr)
-        return output_path
-
-    silenced = _silence_regions_in_audio(result_audio, silence_regions)
-    write_wav_float_atomic(output_path, silenced, sr)
-    return output_path
 
 
 def _get_model_specific_input_path(cut_folder, short_basename, model_key, iteration_target, mask, default_input, cfg):
@@ -564,11 +710,11 @@ def _get_model_specific_input_path(cut_folder, short_basename, model_key, iterat
         return default_input
 
     cut_info = _load_cut_info(cut_folder, short_basename)
-    if not cut_info or 'model_silences' not in cut_info:
+    if not cut_info:
         return default_input
 
-    model_silences = cut_info.get('model_silences', {})
-    if model_key not in model_silences:
+    silences = _get_cumulative_silences(cut_info, model_key, iteration_target - 1)
+    if not silences:
         return default_input
 
     # Look for model-specific next pass file
@@ -586,14 +732,10 @@ def _create_model_specific_next_pass(default_next_pass_path, cut_folder, short_b
                                      iteration_target, mask, sr, cfg):
     """Create a model-specific next pass file with silence sections removed."""
     cut_info = _load_cut_info(cut_folder, short_basename)
-    if not cut_info or 'model_silences' not in cut_info:
+    if not cut_info:
         return None
 
-    model_silences = cut_info.get('model_silences', {})
-    if model_key not in model_silences:
-        return None
-
-    silence_regions = [tuple(r) for r in model_silences[model_key]]
+    silence_regions = _get_cumulative_silences(cut_info, model_key, iteration_target)
     if not silence_regions:
         return None
 
@@ -608,8 +750,7 @@ def _create_model_specific_next_pass(default_next_pass_path, cut_folder, short_b
     original_length = audio.shape[1] if audio.ndim == 2 else len(audio)
     vocal_regions = []
     prev_end = 0
-    sorted_silence = sorted(silence_regions, key=lambda x: x[0])
-    for start, end in sorted_silence:
+    for start, end in silence_regions:
         if start > prev_end:
             vocal_regions.append((prev_end, start))
         prev_end = end
@@ -637,72 +778,20 @@ def _create_model_specific_next_pass(default_next_pass_path, cut_folder, short_b
     return model_specific_path
 
 
-def _reinsert_silence_for_ensemble(shortened_audio, cut_folder, short_basename, model_key, original_length, fill_signal=None):
-    """Reinsert silence into a shortened model result for ensemble alignment."""
-    cut_info = _load_cut_info(cut_folder, short_basename)
-    if not cut_info or 'model_silences' not in cut_info:
-        # No silence info, return as-is (might need padding)
-        if shortened_audio.ndim == 1:
-            shortened_audio = np.expand_dims(shortened_audio, 0)
-        if shortened_audio.shape[1] >= original_length:
-            return shortened_audio[:, :original_length]
-        # Pad with zeros
-        padding = original_length - shortened_audio.shape[1]
+def _expand_model_result_to_working_length(shortened_audio, cut_info, model_key,
+                                           upto_pass, working_length):
+    """Expand a model-specific (shortened) result back to working-length
+    coordinates by inserting zeros at the removed regions. The zeros never
+    reach the ensemble: those regions are excluded per-model by
+    stitched_ensemble."""
+    if shortened_audio.ndim == 1:
+        shortened_audio = np.expand_dims(shortened_audio, 0)
+
+    removed = _get_cumulative_silences(cut_info, model_key, upto_pass)
+    if not removed:
+        if shortened_audio.shape[1] >= working_length:
+            return shortened_audio[:, :working_length]
+        padding = working_length - shortened_audio.shape[1]
         return np.pad(shortened_audio, ((0, 0), (0, padding)), mode='constant')
 
-    model_silences = cut_info.get('model_silences', {})
-    if model_key not in model_silences:
-        # Same as above
-        if shortened_audio.ndim == 1:
-            shortened_audio = np.expand_dims(shortened_audio, 0)
-        if shortened_audio.shape[1] >= original_length:
-            return shortened_audio[:, :original_length]
-        padding = original_length - shortened_audio.shape[1]
-        return np.pad(shortened_audio, ((0, 0), (0, padding)), mode='constant')
-
-    silence_regions = [tuple(r) for r in model_silences[model_key]]
-    result = _insert_silence_at_regions(shortened_audio, silence_regions, original_length)
-
-    # Fill silence regions with the pass input instead of leaving zeros.
-    if fill_signal is not None:
-        if fill_signal.ndim == 1:
-            fill_signal = np.expand_dims(fill_signal, 0)
-        fill_len = min(fill_signal.shape[1], result.shape[1])
-        for start, end in silence_regions:
-            end_clamped = min(end, fill_len, result.shape[1])
-            if start < end_clamped:
-                # Match channel counts
-                if fill_signal.shape[0] >= result.shape[0]:
-                    result[:, start:end_clamped] = fill_signal[:result.shape[0], start:end_clamped]
-                else:
-                    result[:fill_signal.shape[0], start:end_clamped] = fill_signal[:, start:end_clamped]
-
-    return result
-
-
-def _patch_shared_silence_from_previous(next_pass_audio, prev_pass_path, shared_silence_regions, sr):
-    """Patch shared silence regions in the next pass file using snippets from previous pass."""
-    if not shared_silence_regions:
-        return next_pass_audio
-
-    if not prev_pass_path or not os.path.exists(prev_pass_path):
-        return next_pass_audio
-
-    try:
-        prev_audio, _ = read_wav_float(prev_pass_path)
-    except Exception as e:
-        print(f'Failed to read previous pass for patching: {e}')
-        return next_pass_audio
-
-    if prev_audio.ndim == 1:
-        prev_audio = np.expand_dims(prev_audio, 0)
-    if next_pass_audio.ndim == 1:
-        next_pass_audio = np.expand_dims(next_pass_audio, 0)
-
-    result = next_pass_audio.copy()
-
-    for start, end in shared_silence_regions:
-        if end <= prev_audio.shape[1] and end <= result.shape[1]:
-            result[:, start:end] = prev_audio[:, start:end]
-
-    return result
+    return _insert_silence_at_regions(shortened_audio, removed, working_length)

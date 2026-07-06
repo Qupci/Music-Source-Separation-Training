@@ -1,255 +1,29 @@
 import os
-import time
 import numpy as np
 import soundfile as sf
 
-from ensemble import average_waveforms
 from scripts.skipy_slowdown_resample import prepare, restore
 
 from audio_io import (read_wav_float, write_wav_float, write_wav_float_atomic,
-                      is_audio_file_complete, file_size_bytes, ensure_dirs)
+                      is_audio_file_complete, file_size_bytes, ensure_dirs,
+                      _ensure_audio_channels)
 from audio_normalize import slugify_filename, shorten_slug_words
 from bitmask import compute_effective_mask, model_active_for_iteration
-from model_data import MVSEP_MODEL_INFO, get_mvsep_output_dir, get_mvsep_2x_output_dir
+from model_data import (MODEL_INFO, MVSEP_MODEL_INFO, ITERATIVE_LOCAL_MODELS,
+                        get_mvsep_output_dir, get_mvsep_2x_output_dir)
 from dsp_utils import (run_filter, find_model_output_for_file, prepare_mvsep_file,
-                       choose_mvsep_send_input, halve_gain, ms_encode, ms_decode,
-                       inject_side_from_bs)
+                       halve_gain, ms_encode, ms_decode)
 from filename_utils import strip_pass_prefixes
-from job_scheduling import (submit_local_inference, _schedule_local_job, _local_job_active,
+from job_scheduling import (_schedule_local_job, _local_job_active,
                             _schedule_mvsep_job, _mvsep_job_active, _mvsep_has_capacity)
 from silence_detection import (_load_cut_info, _analyze_model_result_for_silence,
-                               _create_model_cut_result, _get_model_specific_input_path,
-                               _create_model_specific_next_pass, _reinsert_silence_for_ensemble,
-                               _compute_overlapping_silence, _patch_shared_silence_from_previous)
+                               _get_model_specific_input_path, _get_pass_silences,
+                               _get_cumulative_silences, _create_model_specific_next_pass,
+                               _expand_model_result_to_working_length, stitched_ensemble,
+                               _extract_vocal_regions, find_detection_instrumental,
+                               SILENCE_THRESHOLD_DB, RAW_SILENCE_THRESHOLD_DB)
 
-
-def reconstruct_next_pass_from_prev(prev_folder, prev_iter, iteration_target, basename, mask,
-                                    input_path, iterative_folder, is_final, cfg, name_maps,
-                                    pass1_src=None, cut_folder=None):
-    """Attempt to reconstruct missing next-pass input from model outputs
-    found in prev_folder. Returns path to reconstructed next_pass or None.
-    """
-    models_iterative_stage = cfg.build_models_iterative_stage()
-    try:
-        working_length_cap = None
-        if cut_folder:
-            try:
-                cut_info_local = _load_cut_info(cut_folder, basename)
-                if cut_info_local:
-                    if cut_info_local.get('was_cut', False) and cut_info_local.get('cut_length', 0) > 0:
-                        working_length_cap = cut_info_local.get('cut_length')
-                    else:
-                        working_length_cap = cut_info_local.get('original_length', 0)
-                    if not (working_length_cap and working_length_cap > 0):
-                        working_length_cap = None
-            except Exception:
-                pass
-
-        existing_candidate = os.path.join(iterative_folder, f'{basename}_pass{iteration_target}_{compute_effective_mask(mask, iteration_target, cfg.iterations_amount)}.wav')
-        if os.path.exists(existing_candidate):
-            return None
-
-        prev_model_files = []
-        for mv_key in MVSEP_MODEL_INFO.keys():
-            if not model_active_for_iteration(mv_key, prev_iter, models_iterative_stage, cfg.iterations_amount):
-                continue
-            mvsep_prev = get_mvsep_output_dir(prev_folder, mv_key)
-            if os.path.exists(mvsep_prev):
-                prev_model_files.extend(find_model_output_for_file(mvsep_prev, basename, '_other', name_maps))
-
-        for mk in ['bs_resurrect', 'mel_v1e', 'mel_v1ep']:
-            pf = os.path.join(prev_folder, mk)
-            if not os.path.exists(pf):
-                continue
-            if mk == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
-                processed = find_model_output_for_file(pf, basename, '_other_pp', name_maps)
-                if processed:
-                    prev_model_files.extend(processed)
-                    continue
-            prev_model_files.extend(find_model_output_for_file(pf, basename, '_other', name_maps))
-
-        try:
-            eff_prev_mask = compute_effective_mask(mask, prev_iter, cfg.iterations_amount)
-            stem_prev = f'{basename}_pass{prev_iter}_{eff_prev_mask}'
-            if cfg.use_2x_slowdown_bs_resurrect and model_active_for_iteration('2x_bs_resurrect', prev_iter, models_iterative_stage, cfg.iterations_amount):
-                two_bs = os.path.join(prev_folder, '2x_bs_resurrect')
-                if os.path.exists(two_bs):
-                    cands = find_model_output_for_file(two_bs, stem_prev, '_other', name_maps)
-                    for c in cands:
-                        bn = os.path.basename(c).lower()
-                        if '_2x_other_res_bhp' in bn:
-                            if c not in prev_model_files:
-                                prev_model_files.append(c)
-            if cfg.use_2x_slowdown_mel_v1e and model_active_for_iteration('2x_mel_v1e', prev_iter, models_iterative_stage, cfg.iterations_amount):
-                two_mel = os.path.join(prev_folder, '2x_mel_v1e')
-                if os.path.exists(two_mel):
-                    cands = find_model_output_for_file(two_mel, stem_prev, '_other', name_maps)
-                    for c in cands:
-                        bn = os.path.basename(c).lower()
-                        if '_2x_other_res_bhp' in bn:
-                            if c not in prev_model_files:
-                                prev_model_files.append(c)
-            mvsep_2x_checks = []
-            if cfg.use_2x_slowdown_mvsep and model_active_for_iteration('2x_mvsep', prev_iter, models_iterative_stage, cfg.iterations_amount):
-                mvsep_2x_checks.append('mvsep')
-            if cfg.use_2x_slowdown_mvsep_scnet_becruily and model_active_for_iteration('2x_mvsep_scnet_becruily', prev_iter, models_iterative_stage, cfg.iterations_amount):
-                mvsep_2x_checks.append('mvsep_scnet_becruily')
-            for mv_key in mvsep_2x_checks:
-                two_mv = get_mvsep_2x_output_dir(prev_folder, mv_key)
-                if os.path.exists(two_mv):
-                    cands = find_model_output_for_file(two_mv, stem_prev, '_other', name_maps)
-                    for c in cands:
-                        bn = os.path.basename(c).lower()
-                        if '_2x_other_res_bhp' in bn and c not in prev_model_files:
-                            prev_model_files.append(c)
-        except Exception:
-            pass
-
-        if not prev_model_files:
-            return None
-
-        waves = []
-        sr = None
-        for p in prev_model_files:
-            try:
-                w, sr = read_wav_float(p)
-                if w.ndim == 1:
-                    w = np.expand_dims(w, 0)
-                if w.ndim == 2 and w.shape[0] > w.shape[1]:
-                    w = w.T
-                waves.append(w)
-            except Exception:
-                continue
-        if not waves:
-            return None
-        target_ch = max(w.shape[0] for w in waves)
-        if target_ch > 2:
-            target_ch = 2
-        normed = []
-        for w in waves:
-            if w.shape[0] == target_ch:
-                normed.append(w)
-                continue
-            if target_ch == 2 and w.shape[0] == 1:
-                normed.append(np.repeat(w, 2, axis=0))
-            elif target_ch == 1 and w.shape[0] >= 2:
-                mono = np.mean(w[:2], axis=0, keepdims=True)
-                normed.append(mono)
-            else:
-                pass
-        if not normed:
-            return None
-        if len(normed) == 1:
-            ensemble_res = normed[0]
-        else:
-            ensemble_res = average_waveforms(normed, [1.0] * len(normed), 'max_fft')
-
-        if prev_iter == 1:
-            src_candidates = []
-            for ext in ['.wav', '.flac', '.mp3', '.m4a']:
-                cand = os.path.join(cfg.input_folder, f'{basename}{ext}')
-                if os.path.exists(cand):
-                    src_candidates.append(cand)
-            src_for_prev = src_candidates[0] if src_candidates else input_path
-        else:
-            eff_mask_for_prev = compute_effective_mask(mask, prev_iter, cfg.iterations_amount)
-            candidate = os.path.join(cfg.ckpt_root, 'iterative', f'pass{prev_iter}_{eff_mask_for_prev}', f'{basename}_pass{prev_iter}_{eff_mask_for_prev}.wav')
-            src_for_prev = candidate if os.path.exists(candidate) else input_path
-
-        src_w, src_sr = read_wav_float(src_for_prev)
-        src_len = src_w.shape[1]
-        ens_len = ensemble_res.shape[1]
-
-        if working_length_cap and working_length_cap > 0:
-            target_len = min(max(src_len, ens_len), working_length_cap)
-        else:
-            target_len = min(src_len, ens_len)
-
-        if src_len < target_len:
-            src_w = np.pad(src_w, ((0, 0), (0, target_len - src_len)), mode='constant')
-        elif src_len > target_len:
-            src_w = src_w[:, :target_len]
-
-        if ens_len < target_len:
-            ensemble_res = np.pad(ensemble_res, ((0, 0), (0, target_len - ens_len)), mode='constant')
-        elif ens_len > target_len:
-            ensemble_res = ensemble_res[:, :target_len]
-
-        diff = src_w - ensemble_res
-        diff_halved = halve_gain(diff)
-        next_pass = src_w - diff_halved
-
-        try:
-            if cfg.amplify_masked_details and iteration_target == cfg.iterations_amount and cfg.iterations_amount > 2:
-                restoration_factor = float(2 ** (cfg.iterations_amount - 2))
-                diff_restored = diff * restoration_factor
-                pass1_w, _ = read_wav_float(pass1_src)
-                pass1_len = pass1_w.shape[1]
-                diff_len = diff.shape[1]
-                if pass1_len < diff_len:
-                    pass1_w = np.pad(pass1_w, ((0, 0), (0, diff_len - pass1_len)), mode='constant')
-                elif pass1_len > diff_len:
-                    pass1_w = pass1_w[:, :diff_len]
-                diff_amp_mask = pass1_w - diff_restored
-                next_pass = diff_amp_mask + diff_halved
-                print(f'Amplify masked details (resume) applied while reconstructing final pass input for {basename}')
-        except Exception as e:
-            print('Non-fatal: amplify_masked_details (resume) failed, using default reconstruction:', e)
-
-        ensure_dirs(iterative_folder)
-        next_pass_filename = f'{basename}_pass{iteration_target}_{compute_effective_mask(mask, iteration_target, cfg.iterations_amount)}.wav'
-        next_pass_path = os.path.join(iterative_folder, next_pass_filename)
-        write_wav_float(next_pass_path, next_pass, src_sr)
-        print(f'Reconstructed missing next-pass from previous iteration outputs: {next_pass_path}')
-        try:
-            if cfg.restore_side_iterative and src_w.shape[0] >= 2:
-                prev_side_store = os.path.join(prev_folder, 'side_res')
-                prev_side_base = f'{basename}_pass{prev_iter}_side'
-                prev_side_found = []
-                if os.path.exists(prev_side_store):
-                    if cfg.post_separate_bs_resurrect:
-                        prev_side_found = find_model_output_for_file(prev_side_store, prev_side_base, '_other_pp', name_maps) or []
-                    if not prev_side_found:
-                        prev_side_found = find_model_output_for_file(prev_side_store, prev_side_base, '_other', name_maps)
-                if prev_side_found:
-                    inject_side_from_bs(prev_side_found[0], next_pass_path)
-                else:
-                    L = src_w[0]
-                    R = src_w[1]
-                    side = (L - R) * 0.5
-                    side_stereo = np.stack([side, side], axis=0)
-                    side_path = os.path.join(iterative_folder, f'{basename}_pass{iteration_target}_side.wav')
-                    write_wav_float(side_path, side_stereo, src_sr)
-                    side_store_new = os.path.join(iterative_folder, 'side_res')
-                    ensure_dirs(side_store_new)
-                    new_side_found = []
-                    if cfg.post_separate_bs_resurrect:
-                        new_side_found = find_model_output_for_file(side_store_new, f'{basename}_pass{iteration_target}_side', '_other_pp', name_maps)
-                    if not new_side_found:
-                        new_side_found = find_model_output_for_file(side_store_new, f'{basename}_pass{iteration_target}_side', '_other', name_maps)
-                    if not new_side_found:
-                        try:
-                            fut = submit_local_inference(None, 'bs_resurrect', side_path, side_store_new, f'{basename}_pass{iteration_target}_side')
-                            res = fut.result()
-                            if res and res.returncode == 0:
-                                time.sleep(0.5)
-                            elif res:
-                                print('Side restore (resume) bs_resurrect returncode:', res.returncode)
-                        except Exception as e:
-                            print('Exception while running side separation during reconstruction fallback:', e)
-                        if cfg.post_separate_bs_resurrect:
-                            new_side_found = find_model_output_for_file(side_store_new, f'{basename}_pass{iteration_target}_side', '_other_pp', name_maps)
-                        if not new_side_found:
-                            new_side_found = find_model_output_for_file(side_store_new, f'{basename}_pass{iteration_target}_side', '_other', name_maps)
-                    if new_side_found:
-                        inject_side_from_bs(new_side_found[0], next_pass_path)
-        except Exception as e:
-            print('Side restoration injection during reconstruction failed (non-fatal):', e)
-
-        return next_pass_path
-    except Exception as e:
-        print('Failed to reconstruct missing next-pass from previous iteration:', e)
-        return None
+CUTOFF_2X = 11025
 
 
 def _audio_length(arr):
@@ -265,6 +39,11 @@ def _audio_length(arr):
 
 
 def _align_audio_length(arr, target_len):
+    """Pad (edge-hold) or trim audio to an exact expected length.
+
+    Only used to keep files at the constant working length of the pass chain;
+    never to shrink content to a minimum across files.
+    """
     if not isinstance(arr, np.ndarray) or target_len is None or target_len <= 0:
         return arr
     if arr.ndim == 1:
@@ -300,6 +79,292 @@ def _align_audio_length(arr, target_len):
         return arr[:target_len, :]
     return arr
 
+
+def _pad_or_trim(arr, target_len):
+    """Zero-pad or trim (channels, samples) audio to target_len."""
+    if arr.ndim == 1:
+        arr = np.expand_dims(arr, 0)
+    if arr.shape[1] < target_len:
+        return np.pad(arr, ((0, 0), (0, target_len - arr.shape[1])), mode='constant')
+    if arr.shape[1] > target_len:
+        return arr[:, :target_len]
+    return arr
+
+
+def final_pass_output_path(basename, mask, cfg):
+    """Canonical path of the final-pass ensemble output.
+
+    Distinct from the final pass INPUT file (which shares the pass{N}_{mask}
+    stem) so the ensemble result is never masked by its own input.
+    """
+    eff = compute_effective_mask(mask, cfg.iterations_amount, cfg.iterations_amount)
+    folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{cfg.iterations_amount}_{eff}')
+    return os.path.join(folder, f'{basename}_pass{cfg.iterations_amount}_{eff}_final.wav')
+
+
+def _expected_result_label(model_key, cfg, is_mid=False):
+    """Which suffix the pipeline waits for from a given model."""
+    base_key = model_key[4:] if model_key.startswith('mid_') else model_key
+    if base_key == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
+        return '_other_pp'
+    if base_key == 'mvsep_scnet_becruily' and cfg.post_separate_scnet:
+        return '_other_pp'
+    return '_other'
+
+
+def _find_result(store_dir, stem, label, name_maps):
+    found = find_model_output_for_file(store_dir, stem, label, name_maps)
+    if label == '_other':
+        found = [p for p in found if not os.path.basename(p).lower().endswith('_pp.wav')]
+    return [p for p in found if is_audio_file_complete(p)]
+
+
+def _write_mid_input(src_path, dest_path):
+    """Write a stereo file whose both channels are the mid (downmix) channel."""
+    if os.path.exists(dest_path) and is_audio_file_complete(dest_path):
+        return dest_path
+    w, sr = read_wav_float(src_path)
+    if w.ndim == 1:
+        w = np.expand_dims(w, 0)
+    mid = np.mean(w[:2], axis=0) if w.shape[0] >= 2 else w[0]
+    write_wav_float_atomic(dest_path, np.stack([mid, mid], axis=0), sr)
+    return dest_path
+
+
+def _maybe_reuse_detection_for_pass1(basename, store_dir, cut_folder, cut_info,
+                                     cfg, name_maps, find_output_fn):
+    """Reuse the detection-stage bs_resurrect separation as the pass1 result.
+
+    The detection stage already separated the full normalized file with
+    bs_resurrect; pass1 input is the cut version of the same file, so the
+    detection instrumental cut to the same vocal regions is the pass1 result.
+    """
+    label = _expected_result_label('bs_resurrect', cfg)
+    if _find_result(store_dir, basename, label, name_maps):
+        return True
+    detect_inst, is_pp = find_detection_instrumental(cut_folder, basename,
+                                                     find_output_fn, cfg)
+    if not detect_inst:
+        return False
+    if cfg.post_separate_bs_resurrect and not is_pp:
+        return False
+    try:
+        audio, sr = read_wav_float(detect_inst)
+        if audio.ndim == 1:
+            audio = np.expand_dims(audio, 0)
+        if cut_info and cut_info.get('was_cut'):
+            vocal_regions = [tuple(r) for r in cut_info.get('base_vocal_regions', [])]
+            if vocal_regions:
+                audio = _extract_vocal_regions(audio, vocal_regions)
+        suffix = '_other_pp' if is_pp else '_other'
+        ensure_dirs(store_dir)
+        dest = os.path.join(store_dir, f'{basename}{suffix}.wav')
+        write_wav_float_atomic(dest, audio, sr)
+        print(f'Reused detection-stage bs_resurrect result for pass1: {dest}')
+        return True
+    except Exception as e:
+        print(f'Non-fatal: could not reuse detection result for pass1: {e}')
+        return False
+
+
+def _mvsep_send_file(input_path, iterative_folder, cfg, mvsep_state, basename):
+    """Prepare the file for MVSep upload; on hard failure disable MVSep for
+    this input instead of looping forever."""
+    disabled = mvsep_state.setdefault('mvsep_disabled', set())
+    if basename in disabled:
+        return None
+    try:
+        return prepare_mvsep_file(input_path, iterative_folder, cfg.api_no_credits)
+    except Exception as e:
+        print(f'MVSep prepare failed for {basename} ({e}); disabling MVSep for this file')
+        disabled.add(basename)
+        return None
+
+
+def _analysis_threshold_for(path, model_key):
+    """Post-processed results keep the strict threshold; raw separations use
+    the raised raw-noise-floor threshold."""
+    if path and path.lower().endswith('_pp.wav'):
+        return SILENCE_THRESHOLD_DB
+    return RAW_SILENCE_THRESHOLD_DB
+
+
+# ---------------------------------------------------------------------------
+# Side restoration helpers
+# ---------------------------------------------------------------------------
+
+def _side_expected_label(cfg):
+    if cfg.side_separation_model == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
+        return '_other_pp'
+    return '_other'
+
+
+def _find_side_result(side_store, side_base, cfg, name_maps):
+    """Returns (results, pp_pending). pp_pending means the raw separation is
+    done but its post-processing has not produced the _pp file yet."""
+    label = _side_expected_label(cfg)
+    found = _find_result(side_store, side_base, label, name_maps)
+    if not found and label == '_other_pp':
+        raw = _find_result(side_store, side_base, '_other', name_maps)
+        if raw:
+            return [], True
+    return found, False
+
+
+def _ensemble_side_into(target_audio, side_mono, sr):
+    """Max-fft ensemble side_mono with the target's S channel and return the
+    stereo result."""
+    enc_ms = ms_encode(target_audio)
+    side_from_pass = enc_ms[1]
+    length = min(side_mono.shape[0], side_from_pass.shape[0])
+    a_side = np.expand_dims(side_mono[:length], 0)
+    a_pass_side = np.expand_dims(side_from_pass[:length], 0)
+    try:
+        ensembled = stitched_ensemble({'a': a_side, 'b': a_pass_side}, {}, length, None)
+    except Exception:
+        ensembled = a_side
+    if ensembled.ndim > 1:
+        ensembled_mono = np.mean(ensembled, axis=0) if ensembled.shape[0] > 1 else ensembled[0]
+    else:
+        ensembled_mono = ensembled
+    enc_ms[1, :length] = ensembled_mono[:length]
+    return ms_decode(enc_ms)
+
+
+def _simple_side_ready(mvsep_state, iterative_folder, basename, iteration_target,
+                       src_w, sr, cfg, name_maps):
+    """Single-separation side restoration. Returns (ready, side_mono or None)."""
+    side_store = os.path.join(iterative_folder, 'side_res')
+    ensure_dirs(side_store)
+    side_base = f'{basename}_pass{iteration_target}_side'
+    side_path = os.path.join(iterative_folder, f'{side_base}.wav')
+
+    if not os.path.exists(side_path):
+        side = (src_w[0] - src_w[1]) * 0.5
+        write_wav_float_atomic(side_path, np.stack([side, side], axis=0), sr)
+
+    found, pp_pending = _find_side_result(side_store, side_base, cfg, name_maps)
+    if found:
+        side_w, _ = read_wav_float(found[0])
+        if side_w.ndim > 1 and side_w.shape[0] > 1:
+            side_mono = np.mean(side_w, axis=0)
+        else:
+            side_mono = side_w[0] if side_w.ndim > 1 else side_w
+        return True, side_mono
+
+    if not pp_pending:
+        job_key = ('side', iteration_target, basename)
+        if not _local_job_active(mvsep_state, job_key):
+            _schedule_local_job(mvsep_state, job_key, cfg.side_separation_model,
+                                side_path, side_store, cfg, name_maps, side_base)
+    return False, None
+
+
+def compute_vocal_referenced_side_inputs(base_audio, vocals_audio):
+    """Build the two finisher-method side-separation inputs.
+
+    Left input:  [vocals_L, L-R]  Right input: [vocals_R, R-L]
+    The first channel exposes the already-extracted vocals as a separation
+    reference so faint side-channel vocals (reverb) are not missed; only the
+    second channel (the side signal) of each result is used afterwards.
+    Falls back to the original mixture channels when no vocals are available.
+    """
+    src = base_audio
+    if src.shape[0] < 2:
+        src = np.vstack([src[0], src[0]])
+    L, R = src[0], src[1]
+    if vocals_audio is not None:
+        v = _ensure_audio_channels(vocals_audio, 2)
+        length = min(v.shape[1], src.shape[1])
+        ref_l = np.zeros_like(L)
+        ref_r = np.zeros_like(R)
+        ref_l[:length] = v[0, :length]
+        ref_r[:length] = v[1, :length]
+    else:
+        ref_l, ref_r = L, R
+    fin_left = np.stack([ref_l, L - R], axis=0)
+    fin_right = np.stack([ref_r, R - L], axis=0)
+    return fin_left, fin_right
+
+
+def finisher_style_side(mvsep_state, side_store, side_prefix, base_audio,
+                        vocals_audio, sr, cfg, name_maps, mask, iteration_target):
+    """Two-separation (finisher-method) side restoration.
+
+    Returns (ready, side_mono or None); schedules the two separations while
+    not ready.
+    """
+    ensure_dirs(side_store)
+    left_base = f'{side_prefix}_finleft'
+    right_base = f'{side_prefix}_finright'
+    left_path = os.path.join(side_store, f'{left_base}.wav')
+    right_path = os.path.join(side_store, f'{right_base}.wav')
+
+    if not (os.path.exists(left_path) and os.path.exists(right_path)):
+        fin_left, fin_right = compute_vocal_referenced_side_inputs(base_audio, vocals_audio)
+        write_wav_float_atomic(left_path, fin_left, sr)
+        write_wav_float_atomic(right_path, fin_right, sr)
+
+    pending = False
+    results = {}
+    for label, path, base in (('left', left_path, left_base), ('right', right_path, right_base)):
+        found, pp_pending = _find_side_result(side_store, base, cfg, name_maps)
+        if found:
+            results[label] = found[0]
+            continue
+        if not pp_pending:
+            job_key = ('fin_side', iteration_target, mask, label, side_prefix)
+            if not _local_job_active(mvsep_state, job_key):
+                _schedule_local_job(mvsep_state, job_key, cfg.side_separation_model,
+                                    path, side_store, cfg, name_maps, base)
+        pending = True
+
+    if pending:
+        return False, None
+
+    left_res_w, _ = read_wav_float(results['left'])
+    right_res_w, _ = read_wav_float(results['right'])
+    lr = left_res_w[1] if left_res_w.shape[0] > 1 else left_res_w[0]
+    rr = right_res_w[1] if right_res_w.shape[0] > 1 else right_res_w[0]
+    length = min(lr.shape[0], rr.shape[0])
+    comb = np.stack([lr[:length], -rr[:length]], axis=0)
+    from dsp_utils import ensemble_signals_to_signal
+    mon = ensemble_signals_to_signal([comb], algorithm='min_fft')
+    if mon.ndim > 1 and mon.shape[0] > 1:
+        mon = np.mean(mon, axis=0, keepdims=True)
+    side_mono = halve_gain(mon)[0]
+    return True, side_mono
+
+
+# ---------------------------------------------------------------------------
+# Resume helper
+# ---------------------------------------------------------------------------
+
+def find_resume_point(basename, mask, cfg):
+    """Determine where to resume processing for a file.
+
+    Returns (pass_number, canonical_input_path or None, final_done).
+    A pass N input file (`{basename}_passN_{eff}.wav`) is created by pass N-1,
+    so resuming simply means re-entering the normal pipeline at the highest
+    pass whose input file exists; process_single_song then finds the existing
+    model outputs and schedules only the missing ones.
+    """
+    final_out = final_pass_output_path(basename, mask, cfg)
+    if os.path.exists(final_out) and is_audio_file_complete(final_out):
+        return cfg.iterations_amount, None, True
+
+    for p in range(cfg.iterations_amount, 1, -1):
+        eff = compute_effective_mask(mask, p, cfg.iterations_amount)
+        folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{p}_{eff}')
+        candidate = os.path.join(folder, f'{basename}_pass{p}_{eff}.wav')
+        if os.path.exists(candidate) and is_audio_file_complete(candidate):
+            return p, candidate, False
+    return 1, None, False
+
+
+# ---------------------------------------------------------------------------
+# Main per-pass processing
+# ---------------------------------------------------------------------------
 
 def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_token,
                         cfg, name_maps,
@@ -338,245 +403,203 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
     iterative_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{iteration_target}_{effective_mask}')
     ensure_dirs(iterative_folder)
 
-    stores = {}
     is_final = (iteration_target == cfg.iterations_amount)
     pending_work = False
 
-    need_mvsep_final = any([
-        cfg.variant_mvsep_only,
-        cfg.variant_lp_mvsep_plus_lp_resurrect_plus_hp_v1ep,
-        cfg.variant_mvsep_plus_resurrect,
-        cfg.variant_mvsep_plus_resurrect_plus_hp_v1ep,
-    ])
-    need_bs_final = any([
-        cfg.variant_mvsep_plus_resurrect,
-        cfg.variant_lp_mvsep_plus_lp_resurrect_plus_hp_v1ep,
-        cfg.variant_mvsep_plus_resurrect_plus_hp_v1ep,
-    ])
-    need_melp_final = any([
-        cfg.variant_lp_mvsep_plus_lp_resurrect_plus_hp_v1ep,
-        cfg.variant_mvsep_plus_resurrect_plus_hp_v1ep,
-    ])
+    def _find_output_fn(store_dir, stem, label):
+        return find_model_output_for_file(store_dir, stem, label, name_maps)
 
+    # Short-circuit: final pass already fully assembled.
+    if is_final:
+        final_out = final_pass_output_path(basename, mask, cfg)
+        if os.path.exists(final_out) and is_audio_file_complete(final_out):
+            return final_out
+
+    # ------------------------------------------------------------------
+    # Decide which models run this pass
+    # ------------------------------------------------------------------
+    stores = {}
     if not is_final:
-        if cfg.use_mel_v1e and model_active_for_iteration('mel_v1e', iteration_target, models_iterative_stage, cfg.iterations_amount):
-            stores['mel_v1e'] = os.path.join(iterative_folder, 'mel_v1e')
-        if cfg.use_bs_resurrect and model_active_for_iteration('bs_resurrect', iteration_target, models_iterative_stage, cfg.iterations_amount):
-            stores['bs_resurrect'] = os.path.join(iterative_folder, 'bs_resurrect')
-        if cfg.use_mvsep and model_active_for_iteration('mvsep', iteration_target, models_iterative_stage, cfg.iterations_amount):
-            stores['mvsep'] = get_mvsep_output_dir(iterative_folder, 'mvsep')
-        if cfg.use_mvsep_scnet_becruily and model_active_for_iteration('mvsep_scnet_becruily', iteration_target, models_iterative_stage, cfg.iterations_amount):
-            stores['mvsep_scnet_becruily'] = get_mvsep_output_dir(iterative_folder, 'mvsep_scnet_becruily')
+        for k in ITERATIVE_LOCAL_MODELS:
+            if cfg.model_enabled(k) and model_active_for_iteration(
+                    k, iteration_target, models_iterative_stage, cfg.iterations_amount):
+                stores[k] = os.path.join(iterative_folder, k)
+        for k in MVSEP_MODEL_INFO.keys():
+            if cfg.model_enabled(k) and model_active_for_iteration(
+                    k, iteration_target, models_iterative_stage, cfg.iterations_amount):
+                stores[k] = get_mvsep_output_dir(iterative_folder, k)
     else:
-        if need_melp_final:
-            stores['mel_v1ep'] = os.path.join(iterative_folder, 'mel_v1ep')
-        if need_bs_final:
-            stores['bs_resurrect'] = os.path.join(iterative_folder, 'bs_resurrect')
-        if need_mvsep_final:
+        for k in cfg.finisher_local_models_needed():
+            stores[k] = os.path.join(iterative_folder, k)
+        if cfg.finisher_needs_mvsep():
             stores['mvsep'] = get_mvsep_output_dir(iterative_folder, 'mvsep')
 
-    # Reconstruct missing next-pass input from previous iteration if needed
-    try:
-        if iteration_target > 1:
-            prev_iter = iteration_target - 1
-            eff_mask_prev = compute_effective_mask(mask, prev_iter, cfg.iterations_amount)
-            prev_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{prev_iter}_{eff_mask_prev}')
-            next_pass_filename = f'{basename}_pass{iteration_target}_{mask}.wav'
-            next_pass_path = os.path.join(iterative_folder, next_pass_filename)
+    # ------------------------------------------------------------------
+    # Schedule separations and collect finished results
+    # ------------------------------------------------------------------
+    model_result_paths = {}
 
-            if not os.path.exists(next_pass_path):
-                reconstructed = reconstruct_next_pass_from_prev(
-                    prev_folder, prev_iter, iteration_target, basename, mask,
-                    input_path, iterative_folder, is_final, cfg, name_maps,
-                    pass1_src=orig_input or input_path, cut_folder=cut_folder)
-                if reconstructed:
-                    input_path = reconstructed
-                    next_pass_path = reconstructed
-    except Exception:
-        pass
-
-    # Side preparation (iterative passes only)
-    side_path = None
-    side_store = None
-    if cfg.restore_side_iterative and not is_final:
-        side_store = os.path.join(iterative_folder, 'side_res')
-        ensure_dirs(side_store)
-        side_path = os.path.join(iterative_folder, f'{basename}_pass{iteration_target}_side.wav')
-        if not os.path.exists(side_path):
-            try:
-                side_src, side_sr = read_wav_float(input_path)
-                if isinstance(side_src, np.ndarray) and side_src.ndim >= 2 and side_src.shape[0] >= 2:
-                    side = (side_src[0] - side_src[1]) * 0.5
-                    side_stereo = np.stack([side, side], axis=0)
-                    write_wav_float(side_path, side_stereo, side_sr)
-            except Exception as e:
-                print('Side file preparation failed:', e)
-
-        side_base = f'{basename}_pass{iteration_target}_side'
-        if side_path and os.path.exists(side_path):
-            processed_side = []
-            if cfg.post_separate_bs_resurrect:
-                processed_side = find_model_output_for_file(side_store, side_base, '_other_pp', name_maps)
-            if processed_side:
-                pass
-            else:
-                raw_side = find_model_output_for_file(side_store, side_base, '_other', name_maps)
-                if raw_side:
-                    if cfg.post_separate_bs_resurrect:
-                        pending_work = True
-                else:
-                    job_key = ('side', iteration_target, basename)
-                    if not _local_job_active(mvsep_state, job_key):
-                        _schedule_local_job(mvsep_state, job_key, 'bs_resurrect', side_path, side_store, cfg, name_maps, side_base)
-                    pending_work = True
-
-    # Schedule model runs
     for k, sd in stores.items():
-        if k in MVSEP_MODEL_INFO:
-            found = []
-            if k == 'mvsep_scnet_becruily' and cfg.post_separate_scnet:
-                found = find_model_output_for_file(sd, basename, '_other_pp', name_maps)
-                if len(found) == 0:
-                    raw_found = find_model_output_for_file(sd, basename, '_other', name_maps)
-                    if raw_found:
-                        pending_work = True
-                        continue
-            else:
-                found = find_model_output_for_file(sd, basename, '_other', name_maps)
+        label = _expected_result_label(k, cfg) if not is_final else (
+            '_other_pp' if (k == 'bs_resurrect' and cfg.post_separate_bs_resurrect) else '_other')
 
-            if len(found) == 0 and mvsep_token:
+        model_input = input_path
+        if cfg.auto_trim_model_specific and cut_folder and iteration_target >= 2 and not is_final:
+            model_input = _get_model_specific_input_path(
+                cut_folder, basename, k, iteration_target, mask, input_path, cfg)
+
+        if k in MVSEP_MODEL_INFO:
+            found = _find_result(sd, basename, label, name_maps)
+            if found:
                 job_key = ('mvsep', k, iteration_target, effective_mask, basename)
+                if _mvsep_job_active(mvsep_state, job_key):
+                    # Download or post-processing may still be running.
+                    pending_work = True
+                else:
+                    model_result_paths[k] = found[0]
+                continue
+            if label == '_other_pp':
+                raw_found = _find_result(sd, basename, '_other', name_maps)
+                if raw_found:
+                    pending_work = True  # post-processing pending
+                    continue
+            if not mvsep_token:
+                continue
+            job_key = ('mvsep', k, iteration_target, effective_mask, basename)
+            if _mvsep_job_active(mvsep_state, job_key):
+                pending_work = True
+            elif _mvsep_has_capacity(mvsep_state):
+                send_file = _mvsep_send_file(model_input, iterative_folder, cfg, mvsep_state, basename)
+                if send_file is None:
+                    continue
+                ensure_dirs(sd)
+                info = MVSEP_MODEL_INFO[k]
+                _schedule_mvsep_job(
+                    mvsep_state, job_key, send_file, sd, cfg, name_maps,
+                    info['sep_type'], info['add_opt1'], 10, 60 * 30,
+                )
+                pending_work = True
+            else:
+                pending_work = True
+            continue
+
+        # Local models
+        found = _find_result(sd, basename, label, name_maps)
+        if found:
+            model_result_paths[k] = found[0]
+            continue
+        if label == '_other_pp':
+            raw_found = _find_result(sd, basename, '_other', name_maps)
+            if raw_found:
+                pending_work = True
+                continue
+
+        # Pass1 can reuse the detection-stage bs_resurrect separation
+        if (k == 'bs_resurrect' and iteration_target == 1 and cut_folder
+                and cfg.auto_trim_normalization):
+            if _maybe_reuse_detection_for_pass1(basename, sd, cut_folder, cut_info,
+                                                cfg, name_maps, _find_output_fn):
+                found = _find_result(sd, basename, label, name_maps)
+                if found:
+                    model_result_paths[k] = found[0]
+                    continue
+                pending_work = True
+                continue
+
+        ensure_dirs(sd)
+        job_key = ('local', iteration_target, effective_mask, k, basename)
+        if not _local_job_active(mvsep_state, job_key):
+            _schedule_local_job(mvsep_state, job_key, k, model_input, sd, cfg, name_maps, basename)
+        pending_work = True
+
+    # Pre-schedule the simple side separation so it runs in parallel with the
+    # model separations (the finisher-style method needs this pass's vocals
+    # and can only start after the ensemble).
+    if (not is_final) and cfg.restore_side_iterative and cfg.iterative_side_method == 'simple':
+        try:
+            side_src, side_sr = read_wav_float(input_path)
+            if isinstance(side_src, np.ndarray) and side_src.ndim >= 2 and side_src.shape[0] >= 2:
+                _simple_side_ready(mvsep_state, iterative_folder, basename,
+                                   iteration_target, side_src, side_sr, cfg, name_maps)
+        except Exception as e:
+            print('Side file preparation failed:', e)
+
+    # ------------------------------------------------------------------
+    # Middle-channel (downmixed) additional separations
+    # ------------------------------------------------------------------
+    mid_result_paths = {}
+    if not is_final and cfg.any_mid_enabled():
+        for k in list(ITERATIVE_LOCAL_MODELS) + list(MVSEP_MODEL_INFO.keys()):
+            if not cfg.mid_enabled(k) or not cfg.model_enabled(k):
+                continue
+            if not model_active_for_iteration(k, iteration_target, models_iterative_stage,
+                                              cfg.iterations_amount):
+                continue
+            mid_key = f'mid_{k}'
+            if k in MVSEP_MODEL_INFO:
+                sd = os.path.join(iterative_folder, 'mid_mvsep_out', MVSEP_MODEL_INFO[k]['subdir'])
+            else:
+                sd = os.path.join(iterative_folder, mid_key)
+
+            model_input = input_path
+            if cfg.auto_trim_model_specific and cut_folder and iteration_target >= 2:
+                model_input = _get_model_specific_input_path(
+                    cut_folder, basename, mid_key, iteration_target, mask, input_path, cfg)
+
+            mid_stem = f'{basename}_pass{iteration_target}_{effective_mask}_{mid_key}_dm'
+            mid_input = os.path.join(iterative_folder, f'{mid_stem}.wav')
+            try:
+                _write_mid_input(model_input, mid_input)
+            except Exception as e:
+                print(f'Non-fatal: mid input creation failed for {mid_key}: {e}')
+                continue
+
+            label = _expected_result_label(mid_key, cfg)
+            found = _find_result(sd, mid_stem, label, name_maps)
+            if found:
+                job_key = (('mvsep_mid', k, iteration_target, effective_mask, basename)
+                           if k in MVSEP_MODEL_INFO else None)
+                if job_key and _mvsep_job_active(mvsep_state, job_key):
+                    pending_work = True
+                else:
+                    mid_result_paths[mid_key] = found[0]
+                continue
+            if label == '_other_pp' and _find_result(sd, mid_stem, '_other', name_maps):
+                pending_work = True
+                continue
+
+            if k in MVSEP_MODEL_INFO:
+                if not mvsep_token:
+                    continue
+                job_key = ('mvsep_mid', k, iteration_target, effective_mask, basename)
                 if _mvsep_job_active(mvsep_state, job_key):
                     pending_work = True
                 elif _mvsep_has_capacity(mvsep_state):
-                    try:
-                        base_input = input_path
-                        if cfg.auto_trim_model_specific and cut_folder and iteration_target >= 2:
-                            base_input = _get_model_specific_input_path(
-                                cut_folder, basename, k, iteration_target, mask, input_path, cfg
-                            )
-                        send_input = choose_mvsep_send_input(
-                            iterative_folder, basename, iteration_target, mask,
-                            next_pass_path if 'next_pass_path' in locals() else None,
-                            base_input,
-                        )
-                        send_file = prepare_mvsep_file(send_input, iterative_folder, cfg.api_no_credits)
-                    except Exception as e:
-                        print('MVSep prepare failed:', e)
-                    else:
-                        ensure_dirs(sd)
-                        info = MVSEP_MODEL_INFO[k]
-                        _schedule_mvsep_job(
-                            mvsep_state, job_key, send_file, sd, cfg, name_maps,
-                            info['sep_type'], info['add_opt1'], 10, 60 * 30,
-                        )
-                        pending_work = True
+                    send_file = _mvsep_send_file(mid_input, iterative_folder, cfg, mvsep_state, basename)
+                    if send_file is None:
+                        continue
+                    ensure_dirs(sd)
+                    info = MVSEP_MODEL_INFO[k]
+                    _schedule_mvsep_job(mvsep_state, job_key, send_file, sd, cfg, name_maps,
+                                        info['sep_type'], info['add_opt1'], 10, 60 * 30)
+                    pending_work = True
                 else:
                     pending_work = True
-            continue
-
-        if k == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
-            processed_found = find_model_output_for_file(sd, basename, '_other_pp', name_maps)
-            if processed_found:
-                found = processed_found
             else:
-                raw_found = find_model_output_for_file(sd, basename, '_other', name_maps)
-                if raw_found:
-                    pending_work = True
-                    continue
                 ensure_dirs(sd)
-                job_key = ('local', iteration_target, effective_mask, k, basename)
+                job_key = ('local_mid', iteration_target, effective_mask, k, basename)
                 if not _local_job_active(mvsep_state, job_key):
-                    model_input = input_path
-                    if cfg.auto_trim_model_specific and cut_folder and iteration_target >= 2:
-                        model_input = _get_model_specific_input_path(
-                            cut_folder, basename, k, iteration_target, mask, input_path, cfg
-                        )
-                    _schedule_local_job(mvsep_state, job_key, k, model_input, sd, cfg, name_maps, basename)
+                    _schedule_local_job(mvsep_state, job_key, k, mid_input, sd, cfg,
+                                        name_maps, mid_stem)
                 pending_work = True
-                continue
-        else:
-            found = find_model_output_for_file(sd, basename, '_other', name_maps)
 
-        if len(found) == 0:
-            ensure_dirs(sd)
-            job_key = ('local', iteration_target, effective_mask, k, basename)
-            if not _local_job_active(mvsep_state, job_key):
-                model_input = input_path
-                if cfg.auto_trim_model_specific and cut_folder and iteration_target >= 2:
-                    model_input = _get_model_specific_input_path(
-                        cut_folder, basename, k, iteration_target, mask, input_path, cfg
-                    )
-                _schedule_local_job(mvsep_state, job_key, k, model_input, sd, cfg, name_maps, basename)
-            pending_work = True
-
-    # Ensure MVSEP outputs are present
-    if mvsep_token:
-        for mv_key in stores.keys():
-            if mv_key in MVSEP_MODEL_INFO:
-                mvsep_sd = stores.get(mv_key)
-                mvsep_found = find_model_output_for_file(mvsep_sd, basename, '_other', name_maps) if mvsep_sd else []
-                if len(mvsep_found) == 0:
-                    pending_work = True
-
-    # Collect model results and perform silence analysis
-    model_results = []
-    model_result_paths = {}
-    for k, sd in stores.items():
-        if k == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
-            found = find_model_output_for_file(sd, basename, '_other_pp', name_maps)
-        elif k == 'mvsep_scnet_becruily' and cfg.post_separate_scnet:
-            found = find_model_output_for_file(sd, basename, '_other_pp', name_maps)
-        else:
-            found = find_model_output_for_file(sd, basename, '_other', name_maps)
-        if len(found) > 0:
-            result_path = found[0]
-            cut_path = os.path.splitext(result_path)[0] + '_cut.wav'
-            if os.path.exists(cut_path) and is_audio_file_complete(cut_path):
-                result_path = cut_path
-            model_results.append(result_path)
-            model_result_paths[k] = found[0]
-
-    # Model-specific silence analysis for pass1
-    if cfg.auto_trim_model_specific and iteration_target == 1 and cut_folder and cut_info and not is_final:
-        try:
-            input_audio_for_analysis = None
-            input_sr = None
-            for model_key, result_path in model_result_paths.items():
-                if model_key.startswith('2x_'):
-                    continue
-                try:
-                    result_dir = os.path.dirname(result_path)
-                    result_base = os.path.splitext(os.path.basename(result_path))[0]
-                    cut_result_path = os.path.join(result_dir, f'{result_base}_cut.wav')
-                    if os.path.exists(cut_result_path) and is_audio_file_complete(cut_result_path):
-                        continue
-
-                    if cut_info.get('model_silences', {}).get(model_key):
-                        continue
-
-                    if input_audio_for_analysis is None:
-                        input_audio_for_analysis, input_sr = read_wav_float(input_path)
-
-                    result_audio, _ = read_wav_float(result_path)
-                    silence_regions = _analyze_model_result_for_silence(
-                        input_audio_for_analysis, result_audio, input_sr,
-                        model_key, cut_folder, basename
-                    )
-                    if silence_regions:
-                        _create_model_cut_result(result_audio, silence_regions, cut_result_path, input_sr)
-                except Exception as e:
-                    print(f'Silence analysis failed for {model_key}: {e}')
-        except Exception as e:
-            print(f'Failed to read input for silence analysis: {e}')
-
-    # 2x slowdown processing (iterative passes only)
-    if (iteration_target != cfg.iterations_amount) and (cfg.use_2x_slowdown_mel_v1e or cfg.use_2x_slowdown_bs_resurrect or cfg.use_2x_slowdown_mvsep or cfg.use_2x_slowdown_mvsep_scnet_becruily):
-        CUTOFF_2X = 11025
+    # ------------------------------------------------------------------
+    # 2x slowdown additional separations
+    # ------------------------------------------------------------------
+    if (not is_final) and cfg.any_slowdown_enabled():
         eff_mask = effective_mask
         expected_fast_frames = None
         slowed_expected_frames = None
-
         try:
             input_info = sf.info(input_path)
             frames_val = getattr(input_info, 'frames', None)
@@ -584,748 +607,505 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
                 expected_fast_frames = int(frames_val)
                 slowed_expected_frames = expected_fast_frames * 2
         except Exception:
-            expected_fast_frames = None
-            slowed_expected_frames = None
+            pass
+
+        def _make_slowed(src_file, dest_path):
+            src_arr, src_sr = read_wav_float(src_file)
+            if isinstance(src_arr, np.ndarray) and src_arr.ndim == 2:
+                src_samples = src_arr.T
+                if src_samples.shape[1] == 1:
+                    src_samples = src_samples[:, 0]
+            else:
+                src_samples = src_arr
+            slowed_arr, _srp = prepare(src_samples, cutoff_freq=CUTOFF_2X, original_sr=src_sr)
+            if isinstance(slowed_arr, np.ndarray) and slowed_arr.ndim == 2 and slowed_arr.shape[0] > slowed_arr.shape[1]:
+                slowed_out = slowed_arr.T
+            else:
+                slowed_out = slowed_arr
+            write_wav_float_atomic(dest_path, slowed_out, src_sr)
+            return dest_path
 
         slowed_input_path = os.path.join(iterative_folder, f"{basename}_pass{iteration_target}_{eff_mask}_11025.wav")
         if not os.path.exists(slowed_input_path):
             try:
-                src_arr, src_sr = read_wav_float(input_path)
-                if isinstance(src_arr, np.ndarray) and src_arr.ndim == 2:
-                    src_samples = src_arr.T
-                    if src_samples.shape[1] == 1:
-                        src_samples = src_samples[:, 0]
-                else:
-                    src_samples = src_arr
-                slowed_arr, _srp = prepare(src_samples, cutoff_freq=CUTOFF_2X, original_sr=src_sr)
-                if isinstance(slowed_arr, np.ndarray) and slowed_arr.ndim == 2 and slowed_arr.shape[0] > slowed_arr.shape[1]:
-                    slowed_out = slowed_arr.T
-                else:
-                    slowed_out = slowed_arr
-                write_wav_float_atomic(slowed_input_path, slowed_out, src_sr)
+                _make_slowed(input_path, slowed_input_path)
             except Exception as e:
                 print('[2x] Failed preparing slowed input:', e)
                 slowed_input_path = None
-        if slowed_input_path and os.path.exists(slowed_input_path):
-            base_stem = f"{basename}_pass{iteration_target}_{eff_mask}_11025"
 
-            def _get_2x_slowed_input(model_key_2x, default_slowed_path, default_base_stem):
-                if not cfg.auto_trim_model_specific or iteration_target < 2 or not cut_folder:
-                    return default_slowed_path, default_base_stem, expected_fast_frames, slowed_expected_frames
+        base_stem = f"{basename}_pass{iteration_target}_{eff_mask}_11025"
 
-                model_specific_input = _get_model_specific_input_path(
-                    cut_folder, basename, model_key_2x, iteration_target, mask, input_path, cfg
-                )
-                if model_specific_input == input_path:
-                    return default_slowed_path, default_base_stem, expected_fast_frames, slowed_expected_frames
+        def _get_2x_slowed_input(model_key_2x):
+            if not cfg.auto_trim_model_specific or iteration_target < 2 or not cut_folder:
+                return slowed_input_path, base_stem, expected_fast_frames, slowed_expected_frames
 
-                model_fast_frames = None
-                model_slowed_frames = None
+            model_specific_input = _get_model_specific_input_path(
+                cut_folder, basename, model_key_2x, iteration_target, mask, input_path, cfg)
+            if model_specific_input == input_path:
+                return slowed_input_path, base_stem, expected_fast_frames, slowed_expected_frames
+
+            model_fast_frames = None
+            model_slowed_frames = None
+            try:
+                model_info = sf.info(model_specific_input)
+                frames_val = getattr(model_info, 'frames', None)
+                if isinstance(frames_val, (int, np.integer)) and frames_val > 0:
+                    model_fast_frames = int(frames_val)
+                    model_slowed_frames = model_fast_frames * 2
+            except Exception:
+                pass
+
+            model_stem = f"{basename}_pass{iteration_target}_{eff_mask}_{model_key_2x}_11025"
+            model_slowed_path = os.path.join(iterative_folder, f"{model_stem}.wav")
+            if not os.path.exists(model_slowed_path):
                 try:
-                    model_info = sf.info(model_specific_input)
-                    frames_val = getattr(model_info, 'frames', None)
-                    if isinstance(frames_val, (int, np.integer)) and frames_val > 0:
-                        model_fast_frames = int(frames_val)
-                        model_slowed_frames = model_fast_frames * 2
+                    _make_slowed(model_specific_input, model_slowed_path)
+                    print(f'[2x] Created model-specific slowed input for {model_key_2x}')
+                except Exception as e:
+                    print(f'[2x] Failed preparing model-specific slowed input for {model_key_2x}: {e}')
+                    return slowed_input_path, base_stem, expected_fast_frames, slowed_expected_frames
+            return model_slowed_path, model_stem, model_fast_frames, model_slowed_frames
+
+        def _restore_2x_result(sep_path, tgt, model_key_2x, fast_frames, slowed_expected):
+            """Read a slowed separation, restore speed, band-split and write the
+            _2x_other_res / _2x_other_res_bhp files. Returns bhp path or None."""
+            nonlocal pending_work
+            res_path = os.path.join(tgt, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res.wav")
+            filt_path = os.path.join(tgt, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
+            try:
+                sep_w, sep_sr = read_wav_float(sep_path)
+                if isinstance(sep_w, np.ndarray) and sep_w.size == 0:
+                    raise RuntimeError('empty separation output')
+                if isinstance(sep_w, np.ndarray) and sep_w.ndim == 2:
+                    sep_samples = sep_w.T
+                    if sep_samples.shape[1] == 1:
+                        sep_samples = sep_samples[:, 0]
+                else:
+                    sep_samples = sep_w
+                if slowed_expected is not None and isinstance(sep_samples, np.ndarray):
+                    sep_len = _audio_length(sep_samples)
+                    if sep_len != slowed_expected:
+                        print(f"[2x] {model_key_2x} output length mismatch ({sep_len} vs expected {slowed_expected}); adjusting locally")
+                        sep_samples = _align_audio_length(sep_samples, slowed_expected)
+                restored_arr, sr_rest = restore(sep_samples, cutoff_freq=CUTOFF_2X, original_sr=sep_sr)
+                if fast_frames is not None and isinstance(restored_arr, np.ndarray):
+                    rest_len = _audio_length(restored_arr)
+                    if rest_len != fast_frames:
+                        restored_arr = _align_audio_length(restored_arr, fast_frames)
+
+                try:
+                    if isinstance(restored_arr, np.ndarray) and restored_arr.ndim == 2 and restored_arr.shape[0] > restored_arr.shape[1]:
+                        res_out = restored_arr.T
+                    else:
+                        res_out = restored_arr
+                    write_wav_float_atomic(res_path, res_out, sr_rest)
+                except Exception as res_write_exc:
+                    print(f"[2x] failed writing restored (pre-bhp) output for {model_key_2x}:", res_write_exc)
+
+                try:
+                    filtered = run_filter(restored_arr, sr_rest, 'bhp', 2000, 3, 1)
+                except Exception:
+                    filtered = restored_arr
+                if isinstance(filtered, np.ndarray) and filtered.size == 0:
+                    print(f"[2x] {model_key_2x} filtered result empty; skipping write")
+                    return None
+                if fast_frames is not None and isinstance(filtered, np.ndarray):
+                    filt_len = _audio_length(filtered)
+                    if filt_len != fast_frames:
+                        filtered = _align_audio_length(filtered, fast_frames)
+                write_wav_float_atomic(filt_path, filtered, sr_rest)
+                if not is_audio_file_complete(filt_path):
+                    raise RuntimeError('Written file failed completion check')
+                return filt_path
+            except Exception as e:
+                print(f'[2x] restore/filter failed for {model_key_2x}:', e)
+                try:
+                    if os.path.exists(sep_path) and file_size_bytes(sep_path) == 0:
+                        os.remove(sep_path)
+                except Exception:
+                    pass
+                pending_work = True
+                return None
+
+        def _process_2x_local(model_key):
+            nonlocal pending_work
+            if not slowed_input_path:
+                return None
+            model_key_2x = '2x_' + model_key
+            actual_slowed_input, actual_base_stem, actual_fast, actual_slowed = _get_2x_slowed_input(model_key_2x)
+
+            job_key = ('2x', iteration_target, eff_mask, model_key, basename)
+            tgt = os.path.join(iterative_folder, model_key_2x)
+            ensure_dirs(tgt)
+            filt_path = os.path.join(tgt, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
+            if os.path.exists(filt_path):
+                if is_audio_file_complete(filt_path):
+                    return filt_path
+                try:
+                    os.remove(filt_path)
                 except Exception:
                     pass
 
-                model_stem = f"{basename}_pass{iteration_target}_{eff_mask}_{model_key_2x}_11025"
-                model_slowed_path = os.path.join(iterative_folder, f"{model_stem}.wav")
+            outs = _find_result(tgt, actual_base_stem, '_other', name_maps)
+            if not outs:
+                if not _local_job_active(mvsep_state, job_key):
+                    _schedule_local_job(mvsep_state, job_key, model_key, actual_slowed_input,
+                                        tgt, cfg, name_maps, actual_base_stem)
+                pending_work = True
+                return None
+            if _local_job_active(mvsep_state, job_key):
+                pending_work = True
+                return None
+            return _restore_2x_result(outs[0], tgt, model_key_2x, actual_fast, actual_slowed)
 
-                if not os.path.exists(model_slowed_path):
-                    try:
-                        src_arr, src_sr = read_wav_float(model_specific_input)
-                        if isinstance(src_arr, np.ndarray) and src_arr.ndim == 2:
-                            src_samples = src_arr.T
-                            if src_samples.shape[1] == 1:
-                                src_samples = src_samples[:, 0]
-                        else:
-                            src_samples = src_arr
-                        slowed_arr, _srp = prepare(src_samples, cutoff_freq=CUTOFF_2X, original_sr=src_sr)
-                        if isinstance(slowed_arr, np.ndarray) and slowed_arr.ndim == 2 and slowed_arr.shape[0] > slowed_arr.shape[1]:
-                            slowed_out = slowed_arr.T
-                        else:
-                            slowed_out = slowed_arr
-                        write_wav_float_atomic(model_slowed_path, slowed_out, src_sr)
-                        print(f'[2x] Created model-specific slowed input for {model_key_2x}')
-                    except Exception as e:
-                        print(f'[2x] Failed preparing model-specific slowed input for {model_key_2x}: {e}')
-                        return default_slowed_path, default_base_stem, expected_fast_frames, slowed_expected_frames
+        for k in ITERATIVE_LOCAL_MODELS:
+            if not cfg.slowdown_enabled(k):
+                continue
+            if not model_active_for_iteration(f'2x_{k}', iteration_target,
+                                              models_iterative_stage, cfg.iterations_amount):
+                continue
+            p = _process_2x_local(k)
+            if p:
+                model_result_paths[f'2x_{k}'] = p
 
-                return model_slowed_path, model_stem, model_fast_frames, model_slowed_frames
+        if mvsep_token and slowed_input_path:
+            for mv_key in MVSEP_MODEL_INFO.keys():
+                if not cfg.slowdown_enabled(mv_key):
+                    continue
+                if not model_active_for_iteration(f'2x_{mv_key}', iteration_target,
+                                                  models_iterative_stage, cfg.iterations_amount):
+                    continue
+                model_key_2x = f'2x_{mv_key}'
+                actual_slowed_input, actual_base_stem, actual_fast, actual_slowed = _get_2x_slowed_input(model_key_2x)
 
-            def _process_2x_local(model_key, folder_name):
-                nonlocal pending_work
-                model_key_2x = '2x_' + model_key
-                actual_slowed_input, actual_base_stem, actual_fast_frames, actual_slowed_expected = _get_2x_slowed_input(model_key_2x, slowed_input_path, base_stem)
+                info = MVSEP_MODEL_INFO[mv_key]
+                mv_sub = get_mvsep_2x_output_dir(iterative_folder, mv_key)
+                ensure_dirs(mv_sub)
+                filt_path = os.path.join(mv_sub, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
+                job_key = ('mvsep_2x', mv_key, iteration_target, eff_mask, basename)
+                if os.path.exists(filt_path) and is_audio_file_complete(filt_path):
+                    model_result_paths[model_key_2x] = filt_path
+                    continue
 
-                job_key = ('2x', iteration_target, eff_mask, model_key, basename)
-                tgt = os.path.join(iterative_folder, folder_name)
-                ensure_dirs(tgt)
-                filt_path = os.path.join(tgt, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
-                if os.path.exists(filt_path):
-                    if is_audio_file_complete(filt_path):
-                        return filt_path
-                    try:
-                        os.remove(filt_path)
-                    except Exception:
-                        pass
-
-                outs = find_model_output_for_file(tgt, actual_base_stem, '_other', name_maps)
+                outs = _find_result(mv_sub, actual_base_stem, '_other', name_maps)
                 if not outs:
-                    if not _local_job_active(mvsep_state, job_key):
-                        _schedule_local_job(mvsep_state, job_key, model_key, actual_slowed_input, tgt, cfg, name_maps, actual_base_stem)
-                    pending_work = True
-                    return None
-
-                sep_path = outs[0]
-                if not is_audio_file_complete(sep_path):
-                    if _local_job_active(mvsep_state, job_key):
-                        print(f"[2x] {model_key} output still writing ({sep_path}); waiting for completion")
-                        pending_work = True
-                        return None
-                    print(f"[2x] {model_key} output incomplete ({sep_path}); re-queueing inference")
-                    try:
-                        os.remove(sep_path)
-                    except Exception:
-                        pass
-                    if not _local_job_active(mvsep_state, job_key):
-                        _schedule_local_job(mvsep_state, job_key, model_key, actual_slowed_input, tgt, cfg, name_maps, actual_base_stem)
-                    pending_work = True
-                    return None
-
-                if actual_slowed_expected is not None:
-                    try:
-                        sep_info = sf.info(sep_path)
-                        sep_frames = getattr(sep_info, 'frames', 0)
-                        if sep_frames != actual_slowed_expected:
-                            if _local_job_active(mvsep_state, job_key):
-                                print(f"[2x] {model_key} output still writing (frames={sep_frames}, expected={actual_slowed_expected}); waiting for completion")
-                                pending_work = True
-                                return None
-                            print(f"[2x] {model_key} output length mismatch in file info (frames={sep_frames}, expected={actual_slowed_expected}); re-queueing inference")
-                            try:
-                                os.remove(sep_path)
-                            except Exception:
-                                pass
-                            if not _local_job_active(mvsep_state, job_key):
-                                _schedule_local_job(mvsep_state, job_key, model_key, actual_slowed_input, tgt, cfg, name_maps, actual_base_stem)
-                            pending_work = True
-                            return None
-                    except Exception as e:
-                        if _local_job_active(mvsep_state, job_key):
-                            print(f"[2x] {model_key} output file info check failed; waiting for completion:", e)
-                            pending_work = True
-                            return None
-                        print(f"[2x] {model_key} output file info check failed; re-queueing inference:", e)
-                        try:
-                            os.remove(sep_path)
-                        except Exception:
-                            pass
-                        if not _local_job_active(mvsep_state, job_key):
-                            _schedule_local_job(mvsep_state, job_key, model_key, slowed_input_path, tgt, cfg, name_maps, base_stem)
-                        pending_work = True
-                        return None
-                try:
-                    sep_w, sep_sr = read_wav_float(sep_path)
-                    if isinstance(sep_w, np.ndarray) and sep_w.size == 0:
-                        print(f"[2x] {model_key} output contained no samples; re-queueing inference")
-                        try:
-                            os.remove(sep_path)
-                        except Exception:
-                            pass
-                        if not _local_job_active(mvsep_state, job_key):
-                            _schedule_local_job(mvsep_state, job_key, model_key, actual_slowed_input, tgt, cfg, name_maps, actual_base_stem)
-                        pending_work = True
-                        return None
-                    if isinstance(sep_w, np.ndarray) and sep_w.ndim == 2:
-                        sep_samples = sep_w.T
-                        if sep_samples.shape[1] == 1:
-                            sep_samples = sep_samples[:, 0]
-                    else:
-                        sep_samples = sep_w
-                    if actual_slowed_expected is not None and isinstance(sep_samples, np.ndarray):
-                        sep_len = _audio_length(sep_samples)
-                        if sep_len != actual_slowed_expected:
-                            print(f"[2x] {model_key} output length mismatch ({sep_len} vs expected {actual_slowed_expected}); adjusting locally")
-                            sep_samples = _align_audio_length(sep_samples, actual_slowed_expected)
-                    restored_arr, sr_rest = restore(sep_samples, cutoff_freq=CUTOFF_2X, original_sr=sep_sr)
-                    if actual_fast_frames is not None and isinstance(restored_arr, np.ndarray):
-                        rest_len = _audio_length(restored_arr)
-                        if rest_len != actual_fast_frames:
-                            print(f"[2x] {model_key} restore length mismatch ({rest_len} vs expected {actual_fast_frames}); adjusting locally")
-                            restored_arr = _align_audio_length(restored_arr, actual_fast_frames)
-
-                    res_path = os.path.join(tgt, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res.wav")
-                    try:
-                        if isinstance(restored_arr, np.ndarray) and restored_arr.ndim == 2 and restored_arr.shape[0] > restored_arr.shape[1]:
-                            res_out = restored_arr.T
-                        else:
-                            res_out = restored_arr
-                        write_wav_float_atomic(res_path, res_out, sr_rest)
-                    except Exception as res_write_exc:
-                        print(f"[2x] failed writing restored (pre-bhp) output for {model_key}:", res_write_exc)
-
-                    try:
-                        filtered = run_filter(restored_arr, sr_rest, 'bhp', 2000, 3, 1)
-                    except Exception:
-                        filtered = restored_arr
-                    if isinstance(filtered, np.ndarray) and filtered.size == 0:
-                        print(f"[2x] {model_key} filtered result empty; skipping write")
-                        return None
-                    if actual_fast_frames is not None and isinstance(filtered, np.ndarray):
-                        filt_len = _audio_length(filtered)
-                        if filt_len != actual_fast_frames:
-                            print(f"[2x] {model_key} filtered length mismatch ({filt_len} vs expected {actual_fast_frames}); adjusting locally")
-                            filtered = _align_audio_length(filtered, actual_fast_frames)
-                    try:
-                        write_wav_float_atomic(filt_path, filtered, sr_rest)
-                        if not is_audio_file_complete(filt_path):
-                            raise RuntimeError('Written file failed completion check')
-                        return filt_path
-                    except Exception as write_exc:
-                        print(f"[2x] failed writing filtered output for {model_key}:", write_exc)
-                        try:
-                            if os.path.exists(filt_path) and not is_audio_file_complete(filt_path):
-                                os.remove(filt_path)
-                        except Exception:
-                            pass
-                        if not _local_job_active(mvsep_state, job_key):
-                            _schedule_local_job(mvsep_state, job_key, model_key, actual_slowed_input, tgt, cfg, name_maps, actual_base_stem)
-                        pending_work = True
-                        return None
-                except Exception as e:
-                    print('[2x] restore/filter failed:', e)
-                    try:
-                        if os.path.exists(sep_path) and file_size_bytes(sep_path) == 0:
-                            os.remove(sep_path)
-                    except Exception:
-                        pass
-                    if not _local_job_active(mvsep_state, job_key):
-                        _schedule_local_job(mvsep_state, job_key, model_key, actual_slowed_input, tgt, cfg, name_maps, actual_base_stem)
-                    pending_work = True
-                    return None
-
-            if cfg.use_2x_slowdown_mel_v1e and model_active_for_iteration('2x_mel_v1e', iteration_target, models_iterative_stage, cfg.iterations_amount):
-                p = _process_2x_local('mel_v1e', '2x_mel_v1e')
-                if p:
-                    p_cut = os.path.splitext(p)[0] + '_cut.wav'
-                    if os.path.exists(p_cut) and is_audio_file_complete(p_cut):
-                        p = p_cut
-                    model_results.append(p)
-                    model_result_paths['2x_mel_v1e'] = p
-            if cfg.use_2x_slowdown_bs_resurrect and model_active_for_iteration('2x_bs_resurrect', iteration_target, models_iterative_stage, cfg.iterations_amount):
-                p = _process_2x_local('bs_resurrect', '2x_bs_resurrect')
-                if p:
-                    p_cut = os.path.splitext(p)[0] + '_cut.wav'
-                    if os.path.exists(p_cut) and is_audio_file_complete(p_cut):
-                        p = p_cut
-                    model_results.append(p)
-                    model_result_paths['2x_bs_resurrect'] = p
-            if mvsep_token:
-                mvsep_2x_targets = []
-                if cfg.use_2x_slowdown_mvsep and model_active_for_iteration('2x_mvsep', iteration_target, models_iterative_stage, cfg.iterations_amount):
-                    mvsep_2x_targets.append('mvsep')
-                if cfg.use_2x_slowdown_mvsep_scnet_becruily and model_active_for_iteration('2x_mvsep_scnet_becruily', iteration_target, models_iterative_stage, cfg.iterations_amount):
-                    mvsep_2x_targets.append('mvsep_scnet_becruily')
-
-                for mv_key in mvsep_2x_targets:
-                    model_key_2x = '2x_' + mv_key
-                    actual_mvsep_slowed_input, actual_mvsep_base_stem, actual_mvsep_fast_frames, actual_mvsep_slowed_expected = _get_2x_slowed_input(model_key_2x, slowed_input_path, base_stem)
-
-                    info = MVSEP_MODEL_INFO[mv_key]
-                    mv2_root = os.path.join(iterative_folder, '2x_mvsep_out')
-                    ensure_dirs(mv2_root)
-                    mv_sub = os.path.join(mv2_root, info['subdir'])
-                    ensure_dirs(mv_sub)
-                    filt_path = os.path.join(mv_sub, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
-                    filt_cut_path = os.path.splitext(filt_path)[0] + '_cut.wav'
-                    job_key = ('mvsep_2x', mv_key, iteration_target, eff_mask, basename)
-                    if os.path.exists(filt_path):
-                        if is_audio_file_complete(filt_path):
-                            if os.path.exists(filt_cut_path) and is_audio_file_complete(filt_cut_path):
-                                model_results.append(filt_cut_path)
-                                model_result_paths[model_key_2x] = filt_cut_path
-                            else:
-                                model_results.append(filt_path)
-                                model_result_paths[model_key_2x] = filt_path
-                            continue
-                        try:
-                            os.remove(filt_path)
-                        except Exception:
-                            pass
-
-                    mv_sub_norm = os.path.normpath(mv_sub).replace('\\', '/').lower()
-                    expect_post = (
-                        mv_key == 'mvsep_scnet_becruily'
-                        and cfg.post_separate_scnet
-                        and '2x_mvsep_out' not in mv_sub_norm
-                    )
-                    target_label = '_other_pp' if expect_post else '_other'
-                    outs = find_model_output_for_file(mv_sub, actual_mvsep_base_stem, target_label, name_maps)
-                    if not outs:
-                        if target_label == '_other_pp':
-                            raw_outs = find_model_output_for_file(mv_sub, actual_mvsep_base_stem, '_other', name_maps)
-                            if raw_outs:
-                                pending_work = True
+                    if not _mvsep_job_active(mvsep_state, job_key):
+                        if _mvsep_has_capacity(mvsep_state):
+                            send_file = _mvsep_send_file(actual_slowed_input, iterative_folder,
+                                                         cfg, mvsep_state, basename)
+                            if send_file is None:
                                 continue
-                        if not _mvsep_job_active(mvsep_state, job_key):
-                            if _mvsep_has_capacity(mvsep_state):
-                                try:
-                                    send_file = prepare_mvsep_file(actual_mvsep_slowed_input, iterative_folder, cfg.api_no_credits)
-                                except Exception as e:
-                                    print(f'[2x] MVSep prepare failed for {mv_key}:', e)
-                                    pending_work = True
-                                    continue
-                                _schedule_mvsep_job(
-                                    mvsep_state, job_key, send_file, mv_sub, cfg, name_maps,
-                                    info['sep_type'], info['add_opt1'], 10, 60 * 30,
-                                )
-                            else:
-                                pending_work = True
-                        pending_work = True
-                        continue
+                            _schedule_mvsep_job(mvsep_state, job_key, send_file, mv_sub, cfg,
+                                                name_maps, info['sep_type'], info['add_opt1'],
+                                                10, 60 * 30)
+                    pending_work = True
+                    continue
+                if _mvsep_job_active(mvsep_state, job_key):
+                    print(f"[2x] {mv_key} download pending; waiting for completion")
+                    pending_work = True
+                    continue
+                p = _restore_2x_result(outs[0], mv_sub, model_key_2x, actual_fast, actual_slowed)
+                if p:
+                    model_result_paths[model_key_2x] = p
 
-                    sep_path = outs[0]
+    # ------------------------------------------------------------------
+    # Per-pass silence analysis (every pass, all separations)
+    # ------------------------------------------------------------------
+    if cfg.auto_trim_model_specific and cut_folder and cut_info and not is_final:
+        working_len_hint = None
+        if cut_info.get('was_cut', False) and cut_info.get('cut_length', 0) > 0:
+            working_len_hint = int(cut_info['cut_length'])
+        elif cut_info.get('original_length', 0) > 0:
+            working_len_hint = int(cut_info['original_length'])
 
-                    if _mvsep_job_active(mvsep_state, job_key):
-                        print(f"[2x] {mv_key} download pending ({sep_path}); waiting for completion")
-                        pending_work = True
-                        continue
+        recorded = _get_pass_silences(_load_cut_info(cut_folder, basename) or cut_info,
+                                      iteration_target)
+        src_cache = {}
 
-                    if not is_audio_file_complete(sep_path):
-                        print(f"[2x] {mv_key} output incomplete ({sep_path}); marking for retry")
-                        try:
-                            os.remove(sep_path)
-                        except Exception:
-                            pass
-                        pending_work = True
-                        continue
+        def _current_src():
+            if 'data' not in src_cache:
+                data, data_sr = read_wav_float(input_path)
+                if data.ndim == 1:
+                    data = np.expand_dims(data, 0)
+                src_cache['data'] = data
+                src_cache['sr'] = data_sr
+            return src_cache['data'], src_cache['sr']
 
-                    try:
-                        sep_w, sep_sr = read_wav_float(sep_path)
-                        if isinstance(sep_w, np.ndarray) and sep_w.ndim == 2:
-                            sep_samples = sep_w.T
-                            if sep_samples.shape[1] == 1:
-                                sep_samples = sep_samples[:, 0]
-                        else:
-                            sep_samples = sep_w
-                        if actual_mvsep_slowed_expected is not None and isinstance(sep_samples, np.ndarray):
-                            sep_len = _audio_length(sep_samples)
-                            if sep_len != actual_mvsep_slowed_expected:
-                                print(f"[2x] {mv_key} output length mismatch ({sep_len} vs expected {actual_mvsep_slowed_expected}); adjusting locally")
-                                sep_samples = _align_audio_length(sep_samples, actual_mvsep_slowed_expected)
-                        restored_arr, sr_rest = restore(sep_samples, cutoff_freq=CUTOFF_2X, original_sr=sep_sr)
-                        if actual_mvsep_fast_frames is not None and isinstance(restored_arr, np.ndarray):
-                            rest_len = _audio_length(restored_arr)
-                            if rest_len != actual_mvsep_fast_frames:
-                                print(f"[2x] {mv_key} restore length mismatch ({rest_len} vs expected {actual_mvsep_fast_frames}); adjusting locally")
-                                restored_arr = _align_audio_length(restored_arr, actual_mvsep_fast_frames)
-
-                        res_path = os.path.join(mv_sub, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res.wav")
-                        try:
-                            if isinstance(restored_arr, np.ndarray) and restored_arr.ndim == 2 and restored_arr.shape[0] > restored_arr.shape[1]:
-                                res_out = restored_arr.T
-                            else:
-                                res_out = restored_arr
-                            write_wav_float_atomic(res_path, res_out, sr_rest)
-                        except Exception as res_write_exc:
-                            print(f"[2x] failed writing restored (pre-bhp) output for {mv_key}:", res_write_exc)
-
-                        try:
-                            filtered = run_filter(restored_arr, sr_rest, 'bhp', 2000, 3, 1)
-                        except Exception:
-                            filtered = restored_arr
-                        if actual_mvsep_fast_frames is not None and isinstance(filtered, np.ndarray):
-                            filt_len = _audio_length(filtered)
-                            if filt_len != actual_mvsep_fast_frames:
-                                print(f"[2x] {mv_key} filtered length mismatch ({filt_len} vs expected {actual_mvsep_fast_frames}); adjusting locally")
-                                filtered = _align_audio_length(filtered, actual_mvsep_fast_frames)
-                        try:
-                            write_wav_float_atomic(filt_path, filtered, sr_rest)
-                            if not is_audio_file_complete(filt_path):
-                                raise RuntimeError('Written file failed completion check')
-                            model_results.append(filt_path)
-                            model_result_paths[model_key_2x] = filt_path
-                        except Exception as write_exc:
-                            print('[2x] mvsep filtered write failed:', write_exc)
-                            try:
-                                if os.path.exists(filt_path) and not is_audio_file_complete(filt_path):
-                                    os.remove(filt_path)
-                            except Exception:
-                                pass
-                            pending_work = True
-                    except Exception as e:
-                        print('[2x] mvsep restore/filter failed:', e)
-
-    # Silence analysis for 2x slowdown models in pass1
-    if cfg.auto_trim_model_specific and iteration_target == 1 and cut_folder and cut_info and not is_final:
-        eff_mask = compute_effective_mask(mask, iteration_target, cfg.iterations_amount)
-        twox_models = []
-        if cfg.use_2x_slowdown_mel_v1e:
-            twox_models.append(('2x_mel_v1e', os.path.join(iterative_folder, '2x_mel_v1e')))
-        if cfg.use_2x_slowdown_bs_resurrect:
-            twox_models.append(('2x_bs_resurrect', os.path.join(iterative_folder, '2x_bs_resurrect')))
-        if cfg.use_2x_slowdown_mvsep:
-            mv_info = MVSEP_MODEL_INFO.get('mvsep', {})
-            twox_models.append(('2x_mvsep', os.path.join(iterative_folder, '2x_mvsep_out', mv_info.get('subdir', 'mvsep'))))
-        if cfg.use_2x_slowdown_mvsep_scnet_becruily:
-            mv_info = MVSEP_MODEL_INFO.get('mvsep_scnet_becruily', {})
-            twox_models.append(('2x_mvsep_scnet_becruily', os.path.join(iterative_folder, '2x_mvsep_out', mv_info.get('subdir', 'scnet_becruily'))))
-
-        for model_key_2x, folder_2x in twox_models:
+        all_results = dict(model_result_paths)
+        all_results.update(mid_result_paths)
+        for model_key, result_path in all_results.items():
+            if model_key in recorded:
+                continue
             try:
-                res_path = os.path.join(folder_2x, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res.wav")
-                bhp_path = os.path.join(folder_2x, f"{basename}_pass{iteration_target}_{eff_mask}_2x_other_res_bhp.wav")
-                if not os.path.exists(res_path) or not is_audio_file_complete(res_path):
-                    continue
+                # 2x results are analyzed on the restored (pre-bhp) file
+                analysis_path = result_path
+                if model_key.startswith('2x_'):
+                    res_candidate = result_path.replace('_2x_other_res_bhp', '_2x_other_res')
+                    if os.path.exists(res_candidate):
+                        analysis_path = res_candidate
 
-                bhp_cut_path = os.path.splitext(bhp_path)[0] + '_cut.wav'
-                if os.path.exists(bhp_cut_path) and is_audio_file_complete(bhp_cut_path):
-                    continue
+                result_audio, _res_sr = read_wav_float(analysis_path)
+                if result_audio.ndim == 1:
+                    result_audio = np.expand_dims(result_audio, 0)
+                src_audio, src_sr = _current_src()
 
-                if cut_info.get('model_silences', {}).get(model_key_2x):
-                    continue
+                working_len = working_len_hint or src_audio.shape[1]
+                cumulative = _get_cumulative_silences(cut_info, model_key, iteration_target - 1)
+                if cumulative:
+                    # shortened input: expand and fill removed regions with the
+                    # source so they stay detected as silent at this pass too
+                    expanded = _expand_model_result_to_working_length(
+                        result_audio, cut_info, model_key, iteration_target - 1, working_len)
+                    fill = _pad_or_trim(src_audio, working_len)
+                    for s, e in cumulative:
+                        e2 = min(e, working_len)
+                        if s < e2:
+                            expanded[:, s:e2] = fill[:expanded.shape[0], s:e2]
+                    result_audio = expanded
 
-                result_audio, result_sr = read_wav_float(res_path)
-                input_audio_for_2x, input_sr = read_wav_float(input_path)
+                analysis_input = _pad_or_trim(src_audio, working_len)
+                if model_key.startswith('mid_'):
+                    mid = np.mean(analysis_input[:2], axis=0)
+                    analysis_input = np.stack([mid, mid], axis=0)
 
+                threshold = _analysis_threshold_for(analysis_path, model_key)
                 silence_regions = _analyze_model_result_for_silence(
-                    input_audio_for_2x, result_audio, input_sr,
-                    model_key_2x, cut_folder, basename
-                )
+                    analysis_input, result_audio, src_sr, model_key,
+                    cut_folder, basename, pass_n=iteration_target,
+                    threshold_db=threshold)
                 if silence_regions:
-                    cut_result_path = os.path.splitext(res_path)[0] + '_cut.wav'
-                    _create_model_cut_result(result_audio, silence_regions, cut_result_path, result_sr)
-
-                    if os.path.exists(bhp_path) and is_audio_file_complete(bhp_path):
-                        try:
-                            bhp_audio, bhp_sr = read_wav_float(bhp_path)
-                            _create_model_cut_result(bhp_audio, silence_regions, bhp_cut_path, bhp_sr)
-                            print(f'Created cut version for {model_key_2x}: {len(silence_regions)} silence regions (both res and bhp)')
-                        except Exception as bhp_e:
-                            print(f'Created cut version for {model_key_2x}: {len(silence_regions)} silence regions (res only, bhp failed: {bhp_e})')
-                    else:
-                        print(f'Created cut version for {model_key_2x}: {len(silence_regions)} silence regions (res only, bhp not available)')
+                    print(f'Detected {len(silence_regions)} vocal-silence region(s) for '
+                          f'{model_key} at pass {iteration_target}')
             except Exception as e:
-                print(f'Silence analysis failed for {model_key_2x}: {e}')
+                print(f'Silence analysis failed for {model_key}: {e}')
+
+        cut_info = _load_cut_info(cut_folder, basename) or cut_info
 
     if pending_work:
         return None
-
-    if len(model_results) == 0:
+    if len(model_result_paths) == 0:
         return None
 
-    # Update model_results to prefer _cut versions
-    if cfg.auto_trim_model_specific:
-        updated_model_results = []
-        for p in model_results:
-            cut_path = os.path.splitext(p)[0] + '_cut.wav'
-            if os.path.exists(cut_path) and is_audio_file_complete(cut_path):
-                updated_model_results.append(cut_path)
-                for mk, mp in model_result_paths.items():
-                    if mp == p:
-                        model_result_paths[mk] = cut_path
-                        break
-            else:
-                updated_model_results.append(p)
-        model_results = updated_model_results
+    # ------------------------------------------------------------------
+    # Ensemble (region-stitched; silence regions exclude their model)
+    # ------------------------------------------------------------------
+    src_w, src_sr = read_wav_float(input_path)
+    if src_w.ndim == 1:
+        src_w = np.expand_dims(src_w, 0)
 
-    # Determine working length from cut_info
-    working_length_for_ensemble = None
-    original_length_for_restore = None
+    working_length = src_w.shape[1]
     if cut_folder and cut_info:
         if cut_info.get('was_cut', False) and cut_info.get('cut_length', 0) > 0:
-            working_length_for_ensemble = cut_info.get('cut_length')
-        else:
-            working_length_for_ensemble = cut_info.get('original_length', 0)
-        original_length_for_restore = cut_info.get('original_length', 0)
-        if not (working_length_for_ensemble and working_length_for_ensemble > 0):
-            working_length_for_ensemble = None
+            working_length = int(cut_info['cut_length'])
+        elif cut_info.get('original_length', 0) > 0 and not cut_info.get('was_cut', False):
+            working_length = int(cut_info['original_length'])
+    src_w = _pad_or_trim(src_w, working_length)
 
-    src_w, src_sr = read_wav_float(input_path)
+    pass_silences = (_get_pass_silences(cut_info, iteration_target)
+                     if (cfg.auto_trim_model_specific and cut_info) else {})
 
-    waves = []
-    sr_values = []
-    lengths = []
-    for idx, p in enumerate(model_results):
-        w, w_sr = read_wav_float(p)
-        if isinstance(w, np.ndarray) and w.ndim == 1:
+    ens_cache_path = os.path.join(
+        iterative_folder, f'{basename}_pass{iteration_target}_{effective_mask}_ens.wav')
+
+    def _load_aligned_result(model_key, path):
+        w, _w_sr = read_wav_float(path)
+        if w.ndim == 1:
             w = np.expand_dims(w, 0)
-
-        if cfg.auto_trim_model_specific and working_length_for_ensemble and cut_folder and iteration_target >= 2 and not is_final:
-            model_key = None
-            for mk in model_result_paths.keys():
-                if model_result_paths.get(mk) == p:
-                    model_key = mk
-                    break
-
-            if model_key and model_key in (cut_info.get('model_silences', {})):
-                w = _reinsert_silence_for_ensemble(w, cut_folder, basename, model_key, working_length_for_ensemble, fill_signal=src_w)
-
-        waves.append(w)
-        sr_values.append(w_sr)
-        lengths.append(w.shape[1] if isinstance(w, np.ndarray) and w.ndim >= 2 else 0)
-
-    if not waves:
-        return None
-
-    min_len = min(lengths) if lengths else 0
-    max_len = max(lengths) if lengths else 0
-    if min_len <= 0:
-        return None
-
-    if working_length_for_ensemble and working_length_for_ensemble > 0:
-        target_len = min(max_len, working_length_for_ensemble)
-        if target_len < min_len:
-            target_len = working_length_for_ensemble
-    else:
-        target_len = min_len
-
-    if any(length != target_len for length in lengths):
-        try:
-            print(f'Aligned model outputs to {target_len} samples for ensemble mixdown')
-        except Exception:
-            pass
-        aligned_waves = []
-        for w in waves:
-            if w.shape[1] < target_len:
-                padding = target_len - w.shape[1]
-                w = np.pad(w, ((0, 0), (0, padding)), mode='constant')
-            elif w.shape[1] > target_len:
-                w = w[:, :target_len]
-            aligned_waves.append(w)
-        waves = aligned_waves
-
-    sr = sr_values[0]
-    if any(s != sr for s in sr_values[1:]):
-        try:
-            print('Warning: sample rate mismatch across model outputs; proceeding with first rate')
-        except Exception:
-            pass
-
-    try:
-        if len(waves) == 1:
-            ensemble_res = waves[0]
+        cumulative = _get_cumulative_silences(cut_info, model_key, iteration_target - 1) if cut_info else []
+        if cumulative:
+            w = _expand_model_result_to_working_length(
+                w, cut_info, model_key, iteration_target - 1, working_length)
         else:
-            ensemble_res = average_waveforms(waves, [1.0] * len(waves), 'max_fft')
-    except Exception:
-        return None
+            w = _pad_or_trim(w, working_length)
+        return w
 
-    if ensemble_res.ndim == 1:
-        ensemble_res = np.expand_dims(ensemble_res, 0)
+    if os.path.exists(ens_cache_path) and is_audio_file_complete(ens_cache_path):
+        ensemble_res, _ = read_wav_float(ens_cache_path)
+        if ensemble_res.ndim == 1:
+            ensemble_res = np.expand_dims(ensemble_res, 0)
+        ensemble_res = _pad_or_trim(ensemble_res, working_length)
+    else:
+        try:
+            waves_by_key = {}
+            silence_map = {}
+            for model_key, path in model_result_paths.items():
+                waves_by_key[model_key] = _load_aligned_result(model_key, path)
+                regions = list(pass_silences.get(model_key, []))
+                cumulative = _get_cumulative_silences(cut_info, model_key, iteration_target - 1) if cut_info else []
+                regions.extend(cumulative)
+                if regions:
+                    silence_map[model_key] = regions
 
-    final_pass_path = None
+            ensemble_res = stitched_ensemble(waves_by_key, silence_map, working_length, src_w)
+        except Exception as e:
+            print(f'Ensemble failed for {basename} pass {iteration_target}: {e}')
+            return None
+
+        if ensemble_res.ndim == 1:
+            ensemble_res = np.expand_dims(ensemble_res, 0)
+
+        # Patch the mid (M) channel with middle-channel separation results
+        if mid_result_paths:
+            try:
+                ens_st = _ensure_audio_channels(ensemble_res, 2)
+                enc_ms = ms_encode(ens_st)
+                base_m = np.expand_dims(enc_ms[0], 0)
+                mid_waves = {'__base__': base_m}
+                mid_silence = {}
+                for mid_key, path in mid_result_paths.items():
+                    w = _load_aligned_result(mid_key, path)
+                    mid_waves[mid_key] = np.expand_dims(np.mean(w[:2], axis=0) if w.shape[0] >= 2 else w[0], 0)
+                    regions = list(pass_silences.get(mid_key, []))
+                    regions.extend(_get_cumulative_silences(cut_info, mid_key, iteration_target - 1) if cut_info else [])
+                    if regions:
+                        mid_silence[mid_key] = regions
+                patched_m = stitched_ensemble(mid_waves, mid_silence, working_length, base_m)
+                if patched_m.ndim > 1:
+                    patched_m = np.mean(patched_m, axis=0) if patched_m.shape[0] > 1 else patched_m[0]
+                enc_ms[0, :working_length] = patched_m[:working_length]
+                ensemble_res = ms_decode(enc_ms)
+                print(f'Patched mid channel with {len(mid_result_paths)} middle-channel result(s)')
+            except Exception as e:
+                print(f'Non-fatal: mid-channel patch failed: {e}')
+
+        write_wav_float_atomic(ens_cache_path, ensemble_res, src_sr)
+
+    ensemble_res = _pad_or_trim(np.asarray(ensemble_res), working_length)
+
+    # ------------------------------------------------------------------
+    # Final pass: write the finished ensemble (with previous-pass side)
+    # ------------------------------------------------------------------
     if is_final:
-        final_pass_filename = f'{basename}_pass{iteration_target}_{compute_effective_mask(mask, iteration_target, cfg.iterations_amount)}.wav'
-        final_pass_path = os.path.join(iterative_folder, final_pass_filename)
-        if not os.path.exists(final_pass_path):
-            if cfg.restore_side_iterative and iteration_target > 1:
-                try:
-                    prev_iter = iteration_target - 1
-                    eff_mask_prev = compute_effective_mask(mask, prev_iter, cfg.iterations_amount)
-                    prev_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{prev_iter}_{eff_mask_prev}')
-                    prev_side_store = os.path.join(prev_folder, 'side_res')
+        final_out = final_pass_output_path(basename, mask, cfg)
+        final_data = ensemble_res
+        if cfg.restore_side_iterative and iteration_target > 1:
+            try:
+                prev_iter = iteration_target - 1
+                eff_prev = compute_effective_mask(mask, prev_iter, cfg.iterations_amount)
+                prev_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{prev_iter}_{eff_prev}')
+                prev_side_store = os.path.join(prev_folder, 'side_res')
+                side_mono = None
+                if cfg.iterative_side_method == 'finisher':
+                    # Rebuild the side signal from the previous pass's two
+                    # finisher-method separations (no new jobs needed).
+                    prev_prefix = f'{basename}_pass{prev_iter}'
+                    results = {}
+                    for lbl in ('finleft', 'finright'):
+                        found, _pp = _find_side_result(prev_side_store, f'{prev_prefix}_{lbl}', cfg, name_maps)
+                        if not found:
+                            found = _find_result(prev_side_store, f'{prev_prefix}_{lbl}', '_other', name_maps)
+                        if found:
+                            results[lbl] = found[0]
+                    if len(results) == 2:
+                        left_res_w, _ = read_wav_float(results['finleft'])
+                        right_res_w, _ = read_wav_float(results['finright'])
+                        lr = left_res_w[1] if left_res_w.shape[0] > 1 else left_res_w[0]
+                        rr = right_res_w[1] if right_res_w.shape[0] > 1 else right_res_w[0]
+                        length = min(lr.shape[0], rr.shape[0])
+                        comb = np.stack([lr[:length], -rr[:length]], axis=0)
+                        from dsp_utils import ensemble_signals_to_signal
+                        mon = ensemble_signals_to_signal([comb], algorithm='min_fft')
+                        if mon.ndim > 1 and mon.shape[0] > 1:
+                            mon = np.mean(mon, axis=0, keepdims=True)
+                        side_mono = halve_gain(mon)[0]
+                else:
                     prev_side_base = f'{basename}_pass{prev_iter}_side'
-                    if os.path.exists(prev_side_store):
-                        if cfg.post_separate_bs_resurrect:
-                            prev_side_found = find_model_output_for_file(prev_side_store, prev_side_base, '_other_pp', name_maps)
-                        else:
-                            prev_side_found = find_model_output_for_file(prev_side_store, prev_side_base, '_other', name_maps)
-                    else:
-                        prev_side_found = []
-                    if prev_side_found:
-                        temp_pre_side = os.path.join(iterative_folder, f'{basename}_temp_final_pre_side.wav')
-                        write_wav_float(temp_pre_side, ensemble_res, sr)
-                        injected_path = inject_side_from_bs(prev_side_found[0], temp_pre_side)
-                        if injected_path and os.path.exists(injected_path):
-                            ensemble_res, sr = read_wav_float(injected_path)
-                        try:
-                            if os.path.exists(temp_pre_side):
-                                os.remove(temp_pre_side)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print('Non-fatal: could not inject previous side into final pass:', e)
-            write_wav_float(final_pass_path, ensemble_res, sr)
-        next_pass_path = None
-    else:
-        src_len = src_w.shape[1]
-        ens_len = ensemble_res.shape[1]
+                    prev_found, _pp_pending = _find_side_result(prev_side_store, prev_side_base, cfg, name_maps)
+                    if not prev_found:
+                        prev_found = _find_result(prev_side_store, prev_side_base, '_other', name_maps)
+                    if prev_found:
+                        side_w, _ = read_wav_float(prev_found[0])
+                        side_mono = np.mean(side_w, axis=0) if (side_w.ndim > 1 and side_w.shape[0] > 1) else (
+                            side_w[0] if side_w.ndim > 1 else side_w)
+                if side_mono is not None:
+                    final_data = _ensemble_side_into(_ensure_audio_channels(final_data, 2), side_mono, src_sr)
+            except Exception as e:
+                print('Non-fatal: could not inject previous side into final pass:', e)
+        write_wav_float_atomic(final_out, final_data, src_sr)
+        return final_out
 
-        if working_length_for_ensemble and working_length_for_ensemble > 0:
-            target_len = min(max(src_len, ens_len), working_length_for_ensemble)
+    # ------------------------------------------------------------------
+    # Build the next pass: halve the extracted vocals in the mixture
+    # ------------------------------------------------------------------
+    diff = src_w - ensemble_res
+    diff_halved = halve_gain(diff)
+    next_pass = src_w - diff_halved
+
+    if cfg.amplify_masked_details and ((iteration_target + 1) == cfg.iterations_amount) and cfg.iterations_amount > 2:
+        try:
+            restoration_factor = float(2 ** (cfg.iterations_amount - 2))
+            diff_restored = diff * restoration_factor
+            pass1_w, _ = read_wav_float(orig_input)
+            if pass1_w.ndim == 1:
+                pass1_w = np.expand_dims(pass1_w, 0)
+            pass1_w = _pad_or_trim(pass1_w, working_length)
+            diff_amp_mask = pass1_w - diff_restored
+            next_pass = diff_amp_mask + diff_halved
+        except Exception as e:
+            print('amplify_masked_details failed, falling back to default next_pass:', e)
+
+    # ------------------------------------------------------------------
+    # Side-channel restoration on the next pass
+    # ------------------------------------------------------------------
+    if cfg.restore_side_iterative and src_w.shape[0] >= 2:
+        if cfg.iterative_side_method == 'finisher':
+            side_store = os.path.join(iterative_folder, 'side_res')
+            vocals_ref = diff  # full-amplitude vocals extracted this pass
+            ready, side_mono = finisher_style_side(
+                mvsep_state, side_store, f'{basename}_pass{iteration_target}',
+                src_w, vocals_ref, src_sr, cfg, name_maps, effective_mask, iteration_target)
         else:
-            target_len = min(src_len, ens_len)
-
-        if src_len < target_len:
-            src_w = np.pad(src_w, ((0, 0), (0, target_len - src_len)), mode='constant')
-        elif src_len > target_len:
-            src_w = src_w[:, :target_len]
-
-        if ens_len < target_len:
-            ensemble_res = np.pad(ensemble_res, ((0, 0), (0, target_len - ens_len)), mode='constant')
-        elif ens_len > target_len:
-            ensemble_res = ensemble_res[:, :target_len]
-
-        diff = src_w - ensemble_res
-        diff_halved = halve_gain(diff)
-
-        next_pass = src_w - diff_halved
-
-        next_iter_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{iteration_target+1}_{compute_effective_mask(mask, iteration_target+1, cfg.iterations_amount)}')
-        ensure_dirs(next_iter_folder)
-
-        if cfg.amplify_masked_details and ((iteration_target + 1) == cfg.iterations_amount) and cfg.iterations_amount > 2:
+            ready, side_mono = _simple_side_ready(
+                mvsep_state, iterative_folder, basename, iteration_target,
+                src_w, src_sr, cfg, name_maps)
+        if not ready:
+            return None
+        if side_mono is not None:
             try:
-                restoration_factor = float(2 ** (cfg.iterations_amount - 2))
-                diff_restored = diff * restoration_factor
-                pass1_w, _ = read_wav_float(orig_input)
-                pass1_len = pass1_w.shape[1]
-                diff_len = diff.shape[1]
-                if pass1_len < diff_len:
-                    pass1_w = np.pad(pass1_w, ((0, 0), (0, diff_len - pass1_len)), mode='constant')
-                elif pass1_len > diff_len:
-                    pass1_w = pass1_w[:, :diff_len]
-                diff_amp_mask = pass1_w - diff_restored
-                alt_next_pass = diff_amp_mask + diff_halved
-                next_pass = alt_next_pass
+                next_pass = _ensemble_side_into(_ensure_audio_channels(next_pass, 2),
+                                                side_mono, src_sr)
             except Exception as e:
-                print('amplify_masked_details failed, falling back to default next_pass:', e)
-        next_pass_filename = f'{basename}_pass{iteration_target+1}_{compute_effective_mask(mask, iteration_target+1, cfg.iterations_amount)}.wav'
-        next_pass_path = os.path.join(next_iter_folder, next_pass_filename)
+                print('Non-fatal: side restoration injection failed:', e)
 
-        # Shared silence patching
-        if cut_folder and cut_info and iteration_target >= 1:
-            try:
-                model_silences = cut_info.get('model_silences', {})
-                if model_silences:
-                    shared_silence = _compute_overlapping_silence(model_silences)
-                    if shared_silence:
-                        if iteration_target == 1:
-                            prev_pass_for_patch = orig_input or input_path
-                        else:
-                            prev_eff_mask = compute_effective_mask(mask, iteration_target, cfg.iterations_amount)
-                            prev_pass_for_patch = os.path.join(
-                                cfg.ckpt_root, 'iterative', f'pass{iteration_target}_{prev_eff_mask}',
-                                f'{basename}_pass{iteration_target}_{prev_eff_mask}.wav'
-                            )
-                        next_pass = _patch_shared_silence_from_previous(
-                            next_pass, prev_pass_for_patch, shared_silence, src_sr
-                        )
-                        print(f'Patched {len(shared_silence)} shared silence region(s) in next pass for {basename}')
-            except Exception as e:
-                print(f'Non-fatal: shared silence patching failed: {e}')
+    next_iter = iteration_target + 1
+    eff_mask_next = compute_effective_mask(mask, next_iter, cfg.iterations_amount)
+    next_iter_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{next_iter}_{eff_mask_next}')
+    ensure_dirs(next_iter_folder)
+    next_pass_path = os.path.join(next_iter_folder, f'{basename}_pass{next_iter}_{eff_mask_next}.wav')
+    write_wav_float_atomic(next_pass_path, next_pass, src_sr)
 
-        write_wav_float(next_pass_path, next_pass, src_sr)
-
-    # Side restoration (iterative passes only)
-    if cfg.restore_side_iterative and src_w.shape[0] >= 2 and (not is_final):
-        side_store = os.path.join(iterative_folder, 'side_res')
-        ensure_dirs(side_store)
-        side_path = os.path.join(iterative_folder, f'{basename}_pass{iteration_target}_side.wav')
+    # ------------------------------------------------------------------
+    # Model-specific (shortened) next pass inputs for the next iteration
+    # ------------------------------------------------------------------
+    if cfg.auto_trim_model_specific and cut_folder and cut_info and next_iter < cfg.iterations_amount:
         try:
-            L = src_w[0, :]
-            R = src_w[1, :]
-            side = (L - R) * 0.5
-            side_stereo = np.stack([side, side], axis=0)
-            write_wav_float(side_path, side_stereo, sr)
-        except Exception:
-            pass
+            updated_cut_info = _load_cut_info(cut_folder, basename) or cut_info
+            candidate_keys = set()
+            per_pass = updated_cut_info.get('pass_model_silences', {}) or {}
+            for pass_map in per_pass.values():
+                candidate_keys.update(pass_map.keys())
+            candidate_keys.update((updated_cut_info.get('model_silences', {}) or {}).keys())
 
-        try:
-            side_base = f'{basename}_pass{iteration_target}_side'
-            side_found = []
-            if cfg.post_separate_bs_resurrect:
-                side_found = find_model_output_for_file(side_store, side_base, '_other_pp', name_maps)
-            if not side_found:
-                raw_side = find_model_output_for_file(side_store, side_base, '_other', name_maps)
-                if raw_side:
-                    if cfg.post_separate_bs_resurrect:
-                        pending_work = True
-                    else:
-                        side_found = raw_side
-                else:
-                    job_key = ('side', iteration_target, basename)
-                    if not _local_job_active(mvsep_state, job_key):
-                        _schedule_local_job(mvsep_state, job_key, 'bs_resurrect', side_path, side_store, cfg, name_maps, side_base)
-                    pending_work = True
-                    if cfg.post_separate_bs_resurrect:
-                        side_found = find_model_output_for_file(side_store, side_base, '_other_pp', name_maps)
-                    else:
-                        side_found = find_model_output_for_file(side_store, side_base, '_other', name_maps)
-
-            if side_found:
-                side_file = side_found[0]
-                side_w, _ = read_wav_float(side_file)
-                if side_w.ndim > 1 and side_w.shape[0] > 1:
-                    bs_mono = np.mean(side_w, axis=0)
-                elif side_w.ndim == 1:
-                    bs_mono = side_w
-                else:
-                    bs_mono = side_w[0]
-
-                target_inject_path = next_pass_path
-                np_next, _ = read_wav_float(target_inject_path)
-                enc_ms = ms_encode(np_next)
-                side_from_pass = enc_ms[1]
-
-                minlen2 = min(bs_mono.shape[0], side_from_pass.shape[0])
-                a_bs = np.expand_dims(bs_mono[:minlen2], 0)
-                a_pass_side = np.expand_dims(side_from_pass[:minlen2], 0)
-
-                try:
-                    ensembled = average_waveforms([a_bs, a_pass_side], [1.0, 1.0], 'max_fft')
-                except Exception:
-                    ensembled = a_bs
-
-                if ensembled.ndim > 1 and ensembled.shape[0] > 1:
-                    ensembled_mono = np.mean(ensembled, axis=0)
-                elif ensembled.ndim > 1:
-                    ensembled_mono = ensembled[0]
-                else:
-                    ensembled_mono = ensembled
-
-                enc_ms[1, :minlen2] = ensembled_mono[:minlen2]
-                restored = ms_decode(enc_ms)
-                write_wav_float(target_inject_path, restored, sr)
-        except Exception:
-            pass
-
-    # Create model-specific next pass versions for the next iteration
-    if cfg.auto_trim_model_specific and next_pass_path and cut_folder and cut_info and iteration_target >= 1 and (iteration_target + 1) < cfg.iterations_amount:
-        try:
-            updated_cut_info = _load_cut_info(cut_folder, basename)
-            model_silences = updated_cut_info.get('model_silences', {}) if updated_cut_info else {}
-            next_iter = iteration_target + 1
-            for model_key in model_silences.keys():
-                if not model_active_for_iteration(model_key, next_iter, models_iterative_stage, cfg.iterations_amount):
+            for model_key in sorted(candidate_keys):
+                if not model_active_for_iteration(model_key, next_iter, models_iterative_stage,
+                                                  cfg.iterations_amount):
                     continue
-
                 model_specific_path = _create_model_specific_next_pass(
                     next_pass_path, cut_folder, basename, model_key,
-                    iteration_target, mask, src_sr, cfg
-                )
+                    iteration_target, mask, src_sr, cfg)
 
                 if model_key.startswith('2x_') and model_specific_path and os.path.exists(model_specific_path):
                     try:
                         model_audio, model_sr = read_wav_float(model_specific_path)
-                        eff_mask_next = compute_effective_mask(mask, next_iter, cfg.iterations_amount)
-                        next_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{next_iter}_{eff_mask_next}')
                         slowdown_path = os.path.join(
-                            next_folder,
-                            f'{basename}_pass{next_iter}_{eff_mask_next}_{model_key}_11025.wav'
-                        )
+                            next_iter_folder,
+                            f'{basename}_pass{next_iter}_{eff_mask_next}_{model_key}_11025.wav')
                         if model_audio.ndim == 1:
                             model_audio = np.expand_dims(model_audio, 0)
-                        if model_audio.ndim == 2:
-                            model_samples = model_audio.T
-                            if model_samples.shape[1] == 1:
-                                model_samples = model_samples[:, 0]
-                        else:
-                            model_samples = model_audio
-                        slowed_arr, _srp = prepare(model_samples, cutoff_freq=11025, original_sr=model_sr)
+                        model_samples = model_audio.T
+                        if model_samples.shape[1] == 1:
+                            model_samples = model_samples[:, 0]
+                        slowed_arr, _srp = prepare(model_samples, cutoff_freq=CUTOFF_2X, original_sr=model_sr)
                         if isinstance(slowed_arr, np.ndarray) and slowed_arr.ndim == 2 and slowed_arr.shape[0] > slowed_arr.shape[1]:
                             slowed_out = slowed_arr.T
                         else:
@@ -1337,14 +1117,4 @@ def process_single_song(input_path, mask, iteration_target, mvsep_state, mvsep_t
         except Exception as e:
             print(f'Non-fatal: creating model-specific next pass versions failed: {e}')
 
-    if next_pass_path is not None:
-        return next_pass_path
-
-    if is_final:
-        try:
-            if final_pass_path and os.path.exists(final_pass_path):
-                return final_pass_path
-        except Exception:
-            pass
-
-    return None
+    return next_pass_path

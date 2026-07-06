@@ -3,21 +3,20 @@ import glob
 import time
 import tempfile
 import numpy as np
-import soundfile as sf
 
-from pipeline_config import PipelineConfig, NameMaps
 from audio_io import (read_wav_float, write_wav_float, write_wav_float_atomic,
-                      ensure_dirs, convert_to_flac, is_audio_file_complete)
+                      ensure_dirs, convert_to_flac, is_audio_file_complete,
+                      _ensure_audio_channels)
 from audio_normalize import _select_wav_subtype
-from filename_utils import _determine_export_sr, _get_short_entry, strip_pass_prefixes
-from model_data import MVSEP_MODEL_INFO, get_mvsep_output_dir, get_mvsep_2x_output_dir
-from bitmask import compute_effective_mask
+from filename_utils import _determine_export_sr, _get_short_entry
+from model_data import MVSEP_MODEL_INFO, get_mvsep_output_dir
 from silence_detection import _restore_with_vocal_regions
 from dsp_utils import (run_filter, ms_encode, ms_decode, halve_gain,
                        find_model_output_for_file, ensemble_signals_to_signal)
 from job_scheduling import (_schedule_local_job, _local_job_active,
-                            _schedule_mvsep_job, _mvsep_job_active,
-                            _mvsep_any_active)
+                            _mvsep_job_active)
+from iterative_processing import (final_pass_output_path,
+                                  compute_vocal_referenced_side_inputs)
 from scripts.v1ep_resonance_remover.v1ep_resonance_remover import process_signal
 
 
@@ -61,9 +60,8 @@ def export_variant_audio(short_basename, original_basename, variant_name,
     if cfg.flac_file:
         fd, temp_path = tempfile.mkstemp(suffix='.wav')
         os.close(fd)
-        temp_subtype = _select_wav_subtype(cfg.export_wav_subtype, fallback='FLOAT')
         try:
-            write_wav_float_atomic(temp_path, arr, target_sr, subtype=temp_subtype)
+            write_wav_float_atomic(temp_path, arr, target_sr, subtype='FLOAT')
             convert_to_flac(temp_path, dest_path, subtype=cfg.pcm_type or 'PCM_24')
         finally:
             try:
@@ -86,7 +84,30 @@ def export_variant_audio(short_basename, original_basename, variant_name,
 # Finisher side-channel helpers
 # ---------------------------------------------------------------------------
 
-def ensure_finisher_side_inputs(base_src_path, short_basename, finisher_dir):
+def _side_result_label(cfg):
+    if cfg.side_separation_model == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
+        return '_other_pp'
+    return '_other'
+
+
+def _compute_finisher_vocals(base_src_path, vocals_src_path):
+    """Already-extracted vocals = pass1 input minus the final instrumental."""
+    if not vocals_src_path or not os.path.exists(vocals_src_path):
+        return None
+    try:
+        base, _sr = read_wav_float(base_src_path)
+        orig, _sr2 = read_wav_float(vocals_src_path)
+        base = _ensure_audio_channels(base, 2)
+        orig = _ensure_audio_channels(orig, 2)
+        length = min(base.shape[1], orig.shape[1])
+        return orig[:, :length] - base[:, :length]
+    except Exception as e:
+        print('Non-fatal: could not compute finisher vocals reference:', e)
+        return None
+
+
+def ensure_finisher_side_inputs(base_src_path, short_basename, finisher_dir,
+                                vocals_src_path=None):
     if base_src_path is None:
         raise FileNotFoundError('Finisher side base source not provided')
     if not os.path.exists(base_src_path):
@@ -107,59 +128,51 @@ def ensure_finisher_side_inputs(base_src_path, short_basename, finisher_dir):
     except Exception as exc:
         raise FileNotFoundError(f'Unable to read finisher side base source: {exc}')
 
-    if src.shape[0] < 2:
-        src = np.vstack([src[0], src[0]])
-
-    L = src[0]
-    R = src[1]
-
-    fin_left = np.stack([L, L - R], axis=0)
-    fin_right = np.stack([R, R - L], axis=0)
+    # Expose the already-extracted vocals in the reference (first) channel so
+    # faint side-channel vocals are separated against a strong reference
+    # instead of being missed (side-channel bleeding fix).
+    vocals = _compute_finisher_vocals(base_src_path, vocals_src_path)
+    fin_left, fin_right = compute_vocal_referenced_side_inputs(src, vocals)
 
     for path, data in ((fin_left_path, fin_left), (fin_right_path, fin_right)):
-        needs_write = True
-        if os.path.exists(path):
-            try:
-                info = sf.info(path)
-                if getattr(info, 'frames', 0) > 0:
-                    needs_write = False
-            except Exception:
-                needs_write = True
-        if needs_write:
-            write_wav_float(path, data, sr)
+        if not (os.path.exists(path) and is_audio_file_complete(path)):
+            write_wav_float_atomic(path, data, sr)
 
     return fin_left_path, fin_right_path
 
 
 def ensure_finisher_side_processing(mvsep_state, short_basename, mask,
-                                    base_src_path, finisher_dir, cfg, name_maps):
+                                    base_src_path, finisher_dir, cfg, name_maps,
+                                    vocals_src_path=None):
     try:
         fin_left_path, fin_right_path = ensure_finisher_side_inputs(
-            base_src_path, short_basename, finisher_dir)
+            base_src_path, short_basename, finisher_dir, vocals_src_path)
     except FileNotFoundError:
         return False
 
     side_store = os.path.join(finisher_dir, 'finisher_side_bs')
     ensure_dirs(side_store)
 
+    expected_label = _side_result_label(cfg)
     pending = False
     for label, path in (('left', fin_left_path), ('right', fin_right_path)):
         side_label = f'{short_basename}_finisher_{label}'
 
-        if cfg.post_separate_bs_resurrect:
-            processed = find_model_output_for_file(side_store, side_label, '_other_pp', name_maps)
-            processed = [p for p in processed if is_audio_file_complete(p)]
-            if processed:
-                continue
-
-        raw = find_model_output_for_file(side_store, side_label, '_other', name_maps)
-        raw = [p for p in raw if is_audio_file_complete(p)]
-        if raw:
+        processed = find_model_output_for_file(side_store, side_label, expected_label, name_maps)
+        processed = [p for p in processed if is_audio_file_complete(p)]
+        if processed:
             continue
+
+        if expected_label == '_other_pp':
+            raw = find_model_output_for_file(side_store, side_label, '_other', name_maps)
+            raw = [p for p in raw if is_audio_file_complete(p)]
+            if raw:
+                pending = True  # post-processing still running
+                continue
 
         job_key = ('finisher_side', cfg.iterations_amount, mask, label, short_basename)
         if not _local_job_active(mvsep_state, job_key):
-            _schedule_local_job(mvsep_state, job_key, 'bs_resurrect', path,
+            _schedule_local_job(mvsep_state, job_key, cfg.side_separation_model, path,
                                 side_store, cfg, name_maps, output_basename=side_label)
         pending = True
 
@@ -170,16 +183,19 @@ def ensure_finisher_side_processing(mvsep_state, short_basename, mask,
 # Side restoration
 # ---------------------------------------------------------------------------
 
-def restore_side_finisher(base_src_path, short_basename, finisher_dir, cfg, name_maps):
-    """Return finisher side signal built from precomputed bs_resurrect outputs."""
-    fin_left_path, fin_right_path = ensure_finisher_side_inputs(
-        base_src_path, short_basename, finisher_dir)
+def restore_side_finisher(base_src_path, short_basename, finisher_dir, cfg, name_maps,
+                          vocals_src_path=None):
+    """Return finisher side signal built from the two side separations."""
+    ensure_finisher_side_inputs(base_src_path, short_basename, finisher_dir,
+                                vocals_src_path)
 
     side_store = os.path.join(finisher_dir, 'finisher_side_bs')
     ensure_dirs(side_store)
 
+    expected_label = _side_result_label(cfg)
+
     def _find_side(side_label):
-        if cfg.post_separate_bs_resurrect:
+        if expected_label == '_other_pp':
             processed = find_model_output_for_file(side_store, side_label, '_other_pp', name_maps)
             if processed:
                 return processed
@@ -190,17 +206,16 @@ def restore_side_finisher(base_src_path, short_basename, finisher_dir, cfg, name
     if len(left_res) == 0 or len(right_res) == 0:
         raise FileNotFoundError('Finisher side separated files not found')
 
-    left_res_path = left_res[0]
-    right_res_path = right_res[0]
+    left_res_w, _ = read_wav_float(left_res[0])
+    right_res_w, _ = read_wav_float(right_res[0])
 
-    left_res_w, _ = read_wav_float(left_res_path)
-    right_res_w, _ = read_wav_float(right_res_path)
-
+    # Only the side (second) channel of each separation is used; the vocal
+    # reference channel is discarded.
     lr = left_res_w[1] if left_res_w.shape[0] > 1 else left_res_w[0]
     rr = right_res_w[1] if right_res_w.shape[0] > 1 else right_res_w[0]
-    rr_inv = -rr
+    length = min(lr.shape[0], rr.shape[0])
 
-    comb = np.stack([lr, rr_inv], axis=0)
+    comb = np.stack([lr[:length], -rr[:length]], axis=0)
     mon = ensemble_signals_to_signal([comb], algorithm='min_fft')
 
     if mon.ndim > 1 and mon.shape[0] > 1:
@@ -212,187 +227,149 @@ def restore_side_finisher(base_src_path, short_basename, finisher_dir, cfg, name
 # Variant building
 # ---------------------------------------------------------------------------
 
-def build_variant_and_restore(short_basename, original_basename, mask,
-                              finisher_iter_folder, variant_name,
-                              need_side_restore, base_for_side,
-                              cfg, name_maps,
-                              cut_info=None, norm_path=None):
-    # Use the finisher iteration folder directly (no 'temp' subdirectory)
-    finisher_dir = finisher_iter_folder
-    ensure_dirs(finisher_dir)
-
-    def get_model_file(model_key):
-        folder = os.path.join(cfg.ckpt_root, 'iterative',
-                              f'pass{cfg.iterations_amount}_{mask}', model_key)
-        if model_key == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
-            files = find_model_output_for_file(folder, short_basename, '_other_pp', name_maps)
-            if not files:
-                return None
-        else:
-            files = find_model_output_for_file(folder, short_basename, '_other', name_maps)
-        # Prefer processed mel_v1ep outputs when present
-        if model_key == 'mel_v1ep' and files:
-            proc = [f for f in files if 'processed' in os.path.basename(f).lower()]
-            if proc:
-                return proc[0]
-        return files[0] if files else None
-
+def _load_finisher_model_signal(model_key, short_basename, mask, cfg, name_maps):
+    """Load a model's final-pass separation as (wave, sr) or (None, None)."""
     iter_pass_folder = os.path.join(cfg.ckpt_root, 'iterative',
                                     f'pass{cfg.iterations_amount}_{mask}')
-    mvsep_candidates = []
-    mvsep_priority = []
-    # if use_mvsep_scnet_becruily:
-    #     mvsep_priority.append('mvsep_scnet_becruily')
-    mvsep_priority.append('mvsep')
-    for mv_key in mvsep_priority:
-        folder = get_mvsep_output_dir(iter_pass_folder, mv_key)
+    if model_key == 'mvsep':
+        candidates = []
+        folder = get_mvsep_output_dir(iter_pass_folder, 'mvsep')
         if os.path.exists(folder):
-            found = find_model_output_for_file(folder, short_basename, '_other', name_maps)
-            for path in found:
-                if path not in mvsep_candidates:
-                    mvsep_candidates.append(path)
-
-    mvsep_file = mvsep_candidates[0] if mvsep_candidates else None
-    mvsep_w = None
-    mvsep_sr = None
-    if mvsep_candidates:
-        mvsep_waves = []
-        for path in mvsep_candidates:
+            candidates = find_model_output_for_file(folder, short_basename, '_other', name_maps)
+        candidates = [p for p in candidates if is_audio_file_complete(p)]
+        if not candidates:
+            return None, None
+        waves = []
+        sr = None
+        for path in candidates:
             try:
                 wave, sr_local = read_wav_float(path)
             except Exception as exc:
                 print('Warning: failed to read MVSEP finisher output', path, exc)
                 continue
-            mvsep_waves.append(wave)
-            if mvsep_sr is None:
-                mvsep_sr = sr_local
-        if mvsep_waves:
-            if len(mvsep_waves) == 1:
-                mvsep_w = mvsep_waves[0]
-            else:
-                mvsep_w = ensemble_signals_to_signal(mvsep_waves, algorithm='max_fft')
-        else:
-            mvsep_file = None
-    bs_file = get_model_file('bs_resurrect')
-    melp_file = get_model_file('mel_v1ep')
+            waves.append(wave)
+            if sr is None:
+                sr = sr_local
+        if not waves:
+            return None, None
+        if len(waves) == 1:
+            return waves[0], sr
+        return ensemble_signals_to_signal(waves, algorithm='max_fft'), sr
 
-    if variant_name == 'mvsep_only':
-        if mvsep_w is None or mvsep_sr is None:
-            raise FileNotFoundError('MVSEP result not found for variant')
-        if len(mvsep_candidates) <= 1 and mvsep_file:
-            ensemble_path = mvsep_file
-        else:
-            ensemble_path = os.path.join(finisher_dir, f'{short_basename}_{variant_name}_ensemble.wav')
-            write_wav_float(ensemble_path, mvsep_w, mvsep_sr)
+    folder = os.path.join(iter_pass_folder, model_key)
+    if not os.path.exists(folder):
+        return None, None
+    if model_key == 'bs_resurrect' and cfg.post_separate_bs_resurrect:
+        files = find_model_output_for_file(folder, short_basename, '_other_pp', name_maps)
     else:
-        sr = mvsep_sr
-        signals_for_ensemble = []
-        if variant_name == 'maxfft(bs_mvsep+bs_resurrect)':
-            if mvsep_w is not None:
-                signals_for_ensemble.append(mvsep_w)
-            if bs_file:
-                bs_w, bs_sr = read_wav_float(bs_file)
-                signals_for_ensemble.append(bs_w)
-                if sr is None:
-                    sr = bs_sr
-        elif variant_name == 'maxfft(lp(bs_mvsep)+lp(bs_resurrect))+hp(mel_v1e+)':
-            if mvsep_w is None or mvsep_sr is None:
-                raise FileNotFoundError('MVSEP result not found for variant')
-            mvsep_hp = run_filter(mvsep_w, mvsep_sr, pass_type='hp', cutoff_hz=8000, poles=3)
-            mvsep_lp = mvsep_w[:, :min(mvsep_w.shape[1], mvsep_hp.shape[1])] - mvsep_hp[:, :min(mvsep_w.shape[1], mvsep_hp.shape[1])]
+        files = find_model_output_for_file(folder, short_basename, '_other', name_maps)
+        files = [f for f in files if not os.path.basename(f).lower().endswith('_pp.wav')]
+    # Prefer processed (resonance-removed) mel_v1ep outputs when present
+    if model_key == 'mel_v1ep' and files:
+        proc = [f for f in files if 'processed' in os.path.basename(f).lower()]
+        if proc:
+            files = proc
+    files = [f for f in files if is_audio_file_complete(f)]
+    if not files:
+        return None, None
+    return read_wav_float(files[0])
 
-            bs_lp = None
-            if bs_file:
-                bs_w, bs_sr = read_wav_float(bs_file)
-                bs_hp = run_filter(bs_w, bs_sr, pass_type='hp', cutoff_hz=8000, poles=3)
-                bs_lp = bs_w[:, :min(bs_w.shape[1], bs_hp.shape[1])] - bs_hp[:, :min(bs_w.shape[1], bs_hp.shape[1])]
-                if sr is None:
-                    sr = bs_sr
 
-            # For this variant: ensemble the LP components with max_fft, then mix HP(mel) on top.
-            lp_inputs = [mvsep_lp]
-            if bs_lp is not None:
-                lp_inputs.append(bs_lp)
-            if not lp_inputs:
-                raise FileNotFoundError('No LP inputs available for maxfft(lp(bs_mvsep)+lp(bs_resurrect))+hp(mel_v1e+)')
+def _band_ensemble(waves, algorithm='max_fft'):
+    if len(waves) == 1:
+        return waves[0]
+    return ensemble_signals_to_signal(waves, algorithm=algorithm)
 
-            # produce max_fft on LP inputs
-            lp_max_fft = ensemble_signals_to_signal(lp_inputs, algorithm='max_fft')
 
-            # If mel finisher present, produce its HP and mix additively on top of LP max-fft
-            if melp_file:
-                melp_w, melp_sr = read_wav_float(melp_file)
-                mel_hp = run_filter(melp_w, melp_sr, pass_type='hp', cutoff_hz=8000, poles=3)
-                # Assume inference outputs (LP and mel HP) are stereo and mix channel-wise
-                lp_max_fft = lp_max_fft[:2]
-                mel_lr = mel_hp[:2]
-                minlen = min(lp_max_fft.shape[1], mel_lr.shape[1])
-                mixed = lp_max_fft[:, :minlen] + mel_lr[:, :minlen]
+def build_variant_and_restore(short_basename, original_basename, mask,
+                              finisher_iter_folder, variant,
+                              need_side_restore, base_for_side,
+                              cfg, name_maps,
+                              cut_info=None, norm_path=None, vocals_src_path=None):
+    """Build one finisher variant.
 
-                sr = sr or melp_sr
-                ensemble_path = os.path.join(finisher_dir, f'{short_basename}_{variant_name}_ensemble.wav')
-                write_wav_float(ensemble_path, mixed, sr)
-            else:
-                raise FileNotFoundError('Apparantly there is no mel_v1e+ file available')
-        elif variant_name == 'maxfft(bs_mvsep+bs_resurrect+hp(mel_v1e+))':
-            if mvsep_w is not None:
-                signals_for_ensemble.append(mvsep_w)
-            if bs_file:
-                bs_w, bs_sr = read_wav_float(bs_file)
-                signals_for_ensemble.append(bs_w)
-                if sr is None:
-                    sr = bs_sr
-            if melp_file:
-                melp_w, melp_sr = read_wav_float(melp_file)
-                mel_hp = run_filter(melp_w, melp_sr, pass_type='hp', cutoff_hz=8000, poles=3)
-                signals_for_ensemble.append(mel_hp)
-                if sr is None:
-                    sr = melp_sr
+    variant: {'low': [...], 'high': [...], 'split': bool, 'name': str}
+    Full-band variants max_fft-ensemble all models. Split variants max_fft the
+    low-passed 'low' models and the high-passed 'high' models separately
+    (crossover cfg.finisher_split_hz) and sum both bands.
+    """
+    finisher_dir = finisher_iter_folder
+    ensure_dirs(finisher_dir)
+    variant_name = variant['name']
+
+    def _load_models(model_keys):
+        loaded = []
+        sr_out = None
+        for mk in model_keys:
+            wave, sr_local = _load_finisher_model_signal(mk, short_basename, mask, cfg, name_maps)
+            if wave is None:
+                raise FileNotFoundError(f'Finisher model result not found: {mk}')
+            loaded.append(wave)
+            if sr_out is None:
+                sr_out = sr_local
+        return loaded, sr_out
+
+    ensemble_path = os.path.join(finisher_dir, f'{short_basename}_{variant_name}_ensemble.wav')
+    if not (os.path.exists(ensemble_path) and is_audio_file_complete(ensemble_path)):
+        if not variant['split']:
+            waves, sr = _load_models(variant['low'])
+            mixed = _band_ensemble(waves)
         else:
-            raise NotImplementedError(f'Variant {variant_name} not implemented')
-
-        # If the branch above already constructed `ensemble_path` (for complex
-        # variants like LP+HP) then skip the generic assembly. Otherwise ensure
-        # we have input files and build the ensemble from `signals_for_ensemble`.
-        if 'ensemble_path' not in locals():
-            if not signals_for_ensemble:
-                raise FileNotFoundError('No input files available to build variant')
-            mixed = ensemble_signals_to_signal(signals_for_ensemble, algorithm='max_fft')
-            ensemble_path = os.path.join(finisher_dir, f'{short_basename}_{variant_name}_ensemble.wav')
-            write_wav_float(ensemble_path, mixed, sr)
+            split_hz = int(cfg.finisher_split_hz or 6000)
+            band_signals = []
+            sr = None
+            if variant['low']:
+                low_waves, sr_low = _load_models(variant['low'])
+                sr = sr or sr_low
+                lp_waves = []
+                for w in low_waves:
+                    hp = run_filter(w, sr_low, pass_type='hp', cutoff_hz=split_hz, poles=3)
+                    length = min(w.shape[1], hp.shape[1])
+                    lp_waves.append(w[:, :length] - hp[:, :length])
+                band_signals.append(_band_ensemble(lp_waves))
+            if variant['high']:
+                high_waves, sr_high = _load_models(variant['high'])
+                sr = sr or sr_high
+                hp_waves = [run_filter(w, sr_high, pass_type='hp', cutoff_hz=split_hz, poles=3)
+                            for w in high_waves]
+                band_signals.append(_band_ensemble(hp_waves))
+            if not band_signals:
+                raise FileNotFoundError('No band signals available for variant')
+            if len(band_signals) == 1:
+                mixed = band_signals[0]
+            else:
+                lo, hi = band_signals[0][:2], band_signals[1][:2]
+                length = min(lo.shape[1], hi.shape[1])
+                mixed = lo[:, :length] + hi[:, :length]
+        write_wav_float_atomic(ensemble_path, mixed, sr)
 
     if need_side_restore:
-        base_src = base_for_side
-        if not base_src:
+        if not base_for_side:
             raise FileNotFoundError('Base source for side restoration not found')
-        # Get the processed mono highpass signal from restore_side_finisher
-        hp_w = restore_side_finisher(base_src, short_basename, finisher_dir, cfg, name_maps)
+        # Mono side signal from the two vocal-referenced separations
+        hp_w = restore_side_finisher(base_for_side, short_basename, finisher_dir,
+                                     cfg, name_maps, vocals_src_path)
 
-        # Encode the variant ensemble to M/S
         enc, sr = read_wav_float(ensemble_path)
-        enc_ms = ms_encode(enc)
+        enc_ms = ms_encode(_ensure_audio_channels(enc, 2))
 
-        # Replace the left channel (M) with finisher_side_to_monomin_min_fft_hp
-        side_to_monomax = enc_ms.copy()
-        minlen = min(side_to_monomax.shape[1], hp_w.shape[1])
-        side_to_monomax[0, :minlen] = hp_w[0, :minlen]
+        # Replace the S channel with the max_fft ensemble of the restored side
+        # and the variant's own side channel.
+        length = min(enc_ms.shape[1], hp_w.shape[1])
+        side_pair = np.stack([hp_w[0, :length], enc_ms[1, :length]], axis=0)
+        side_mono = ensemble_signals_to_signal([side_pair], algorithm='max_fft')
+        if side_mono.ndim > 1:
+            side_mono = side_mono[0]
+        enc_ms[1, :length] = side_mono[:length]
 
-        # Apply max_fft ensemble on variant_side_to_monomax
-        side_mono_w = ensemble_signals_to_signal([side_to_monomax], algorithm='max_fft')
-
-        # Replace the right channel (S) with variant_side_to_monomax_max_fft
-        minlen2 = min(enc_ms.shape[1], side_mono_w.shape[1])
-        enc_ms[1, :minlen2] = side_mono_w[0, :minlen2]
-
-        # Decode back to stereo
         restored = ms_decode(enc_ms)
         return export_variant_audio(
-            short_basename, original_basename, variant_name, '_ensemble_side',
+            short_basename, original_basename, variant_name, '_side',
             restored, sr, cfg, name_maps, cut_info=cut_info, norm_path=norm_path)
     else:
         final_data, final_sr = read_wav_float(ensemble_path)
         return export_variant_audio(
-            short_basename, original_basename, variant_name, '_ensemble',
+            short_basename, original_basename, variant_name, '',
             final_data, final_sr, cfg, name_maps, cut_info=cut_info, norm_path=norm_path)
 
 
@@ -419,31 +396,19 @@ def process_finisher_stage(item, mask, mvsep_state, finisher_root,
         print(f"\nFinisher: building variants for {original_basename}")
         item['finisher_logged'] = True
 
-    if not any_expected_outputs_exist(iter_pass_folder, short_basename,
-                                     cfg.iterations_amount, name_maps):
-        if _mvsep_any_active(mvsep_state):
-            print(f'Waiting for MVSep to complete for {original_basename} before finisher...')
-        if time.time() - wait_start > wait_timeout:
-            print(f'Waited {wait_timeout} seconds for pass{cfg.iterations_amount} outputs for '
-                  f'{original_basename}; proceeding without finisher for this file')
-            return True, None
-        return False, 3
-
     finisher_pass_file = item.get('final_pass_path')
-    if not finisher_pass_file:
-        finisher_pass_file = os.path.join(
-            iter_pass_folder,
-            f'{short_basename}_pass{cfg.iterations_amount}_{mask}.wav')
+    if not finisher_pass_file or not os.path.exists(finisher_pass_file):
+        finisher_pass_file = final_pass_output_path(short_basename, mask, cfg)
 
-    pass1_folder = os.path.join(cfg.ckpt_root, 'iterative', 'pass1_0')
-    pass1_file = os.path.join(pass1_folder, f'{short_basename}_pass1_0.wav')
-
-    if cfg.restore_side_iterative and finisher_pass_file and os.path.exists(finisher_pass_file):
+    if os.path.exists(finisher_pass_file):
         base_for_side = finisher_pass_file
-    elif os.path.exists(pass1_file):
-        base_for_side = pass1_file
+    elif item.get('orig') and os.path.exists(item['orig']):
+        base_for_side = item['orig']
     else:
         base_for_side = None
+
+    # The pass1 input (cut/normalized file) provides the vocals reference.
+    vocals_src_path = item.get('orig') if item.get('orig') and os.path.exists(item.get('orig')) else None
 
     if cfg.restore_side_variant and base_for_side is None:
         if time.time() - wait_start > wait_timeout:
@@ -481,12 +446,8 @@ def process_finisher_stage(item, mask, mvsep_state, finisher_root,
             pass
         item['finisher_cleanup_done'] = True
 
-    mel_variants = {
-        'maxfft(lp(bs_mvsep)+lp(bs_resurrect))+hp(mel_v1e+)',
-        'maxfft(bs_mvsep+bs_resurrect+hp(mel_v1e+))',
-    }
-    needs_melp = bool(mel_variants.intersection(enabled_variants))
-
+    # mel_v1ep resonance removal pre-step (when any variant uses mel_v1ep)
+    needs_melp = any('mel_v1ep' in (v['low'] + v['high']) for v in enabled_variants)
     mel_state = item.setdefault('melp_state', {'done': False, 'last_attempt': 0.0})
     if needs_melp and not mel_state['done']:
         melp_folder = os.path.join(iter_pass_folder, 'mel_v1ep')
@@ -498,27 +459,27 @@ def process_finisher_stage(item, mask, mvsep_state, finisher_root,
         elif mel_candidates and (time.time() - mel_state['last_attempt'] > 30):
             mel_state['last_attempt'] = time.time()
             melp_file = mel_candidates[0]
-            bs_folder = os.path.join(iter_pass_folder, 'bs_resurrect')
-            bs_cand = (find_model_output_for_file(bs_folder, short_basename, '_other', name_maps)
-                       if os.path.exists(bs_folder) else [])
-            mvsep_cand = []
-            mvsep_priority_local = []
-            if cfg.use_mvsep_scnet_becruily:
-                mvsep_priority_local.append('mvsep_scnet_becruily')
-            mvsep_priority_local.append('mvsep')
-            for mv_key in mvsep_priority_local:
-                mvsep_folder_local = get_mvsep_output_dir(iter_pass_folder, mv_key)
-                if os.path.exists(mvsep_folder_local):
-                    mvsep_cand.extend(
-                        find_model_output_for_file(mvsep_folder_local, short_basename,
-                                                   '_other', name_maps))
-            replace_source = bs_cand[0] if bs_cand else (mvsep_cand[0] if mvsep_cand else None)
+            replace_source = None
+            for mk in ('bs_resurrect', 'mvsep'):
+                wave_path = None
+                if mk == 'mvsep':
+                    folder = get_mvsep_output_dir(iter_pass_folder, 'mvsep')
+                    found = (find_model_output_for_file(folder, short_basename, '_other', name_maps)
+                             if os.path.exists(folder) else [])
+                else:
+                    folder = os.path.join(iter_pass_folder, mk)
+                    found = (find_model_output_for_file(folder, short_basename, '_other', name_maps)
+                             if os.path.exists(folder) else [])
+                found = [p for p in found if is_audio_file_complete(p)]
+                if found:
+                    wave_path = found[0]
+                if wave_path:
+                    replace_source = wave_path
+                    break
             try:
-                proc_out_dir = melp_folder
-                ensure_dirs(proc_out_dir)
+                ensure_dirs(melp_folder)
                 base = os.path.splitext(os.path.basename(melp_file))[0]
-                proc_name = f"{base}_processed.wav"
-                proc_path = os.path.join(proc_out_dir, proc_name)
+                proc_path = os.path.join(melp_folder, f"{base}_processed.wav")
                 print(f'Processing mel_v1ep for resonance removal: input={melp_file}, replace={replace_source}')
                 processed_audio, _, out_sr = process_signal(
                     melp_file, reference=None, replace=replace_source)
@@ -540,71 +501,42 @@ def process_finisher_stage(item, mask, mvsep_state, finisher_root,
         if not item.get('finisher_side_ready'):
             side_ready = ensure_finisher_side_processing(
                 mvsep_state, short_basename, mask, base_for_side,
-                finisher_dir, cfg, name_maps)
+                finisher_dir, cfg, name_maps, vocals_src_path)
             if side_ready:
                 item['finisher_side_ready'] = True
             else:
                 now = time.time()
                 last_log = item.setdefault('finisher_side_wait_log', 0.0)
                 if now - last_log > 30:
-                    print(f'Waiting for finisher side bs_resurrect outputs for {original_basename}...')
+                    print(f'Waiting for finisher side separations for {original_basename}...')
                     item['finisher_side_wait_log'] = now
                 return False, 5
 
     completed = item.setdefault('finisher_variants_done', set())
     variant_wait_logs = item.setdefault('finisher_variant_wait_logs', {})
-    pending_variants = [v for v in enabled_variants if v not in completed]
-
-    variant_mvsep_dependencies = {
-        'mvsep_only': ['mvsep'],
-        'maxfft(bs_mvsep+bs_resurrect)': ['mvsep'],
-        'maxfft(lp(bs_mvsep)+lp(bs_resurrect))+hp(mel_v1e+)': ['mvsep'],
-        'maxfft(bs_mvsep+bs_resurrect+hp(mel_v1e+))': ['mvsep'],
-    }
     dependency_log = item.setdefault('finisher_dependency_wait_logs', {})
+    pending_variants = [v for v in enabled_variants if v['name'] not in completed]
 
-    for variant_name in pending_variants:
-        deps = variant_mvsep_dependencies.get(variant_name, [])
-        if deps:
-            for dep in deps:
-                job_key = ('mvsep', dep, cfg.iterations_amount, mask, short_basename)
-                if _mvsep_job_active(mvsep_state, job_key):
-                    now = time.time()
-                    last_log = dependency_log.get((variant_name, dep, 'active'), 0.0)
-                    if now - last_log > 30:
-                        print(f'Finisher variant {variant_name} waiting for active MVSep job '
-                              f'({dep}) for {original_basename}...')
-                        dependency_log[(variant_name, dep, 'active')] = now
-                    return False, 5
-
-            deps_ready = True
-            for dep in deps:
-                dep_folder = get_mvsep_output_dir(iter_pass_folder, dep)
-                dep_outputs = (find_model_output_for_file(dep_folder, short_basename,
-                                                          '_other', name_maps)
-                               if os.path.exists(dep_folder) else [])
-                dep_outputs = [p for p in dep_outputs if is_audio_file_complete(p)]
-                if not dep_outputs:
-                    deps_ready = False
-                    now = time.time()
-                    last_log = dependency_log.get((variant_name, dep, 'outputs'), 0.0)
-                    if now - last_log > 30:
-                        print(f'Finisher variant {variant_name} waiting for MVSep outputs '
-                              f'({dep}) for {original_basename}...')
-                        dependency_log[(variant_name, dep, 'outputs')] = now
-                    break
-            if not deps_ready:
+    for variant in pending_variants:
+        variant_name = variant['name']
+        if 'mvsep' in variant['low'] + variant['high']:
+            job_key = ('mvsep', 'mvsep', cfg.iterations_amount, mask, short_basename)
+            if _mvsep_job_active(mvsep_state, job_key):
+                now = time.time()
+                last_log = dependency_log.get((variant_name, 'active'), 0.0)
+                if now - last_log > 30:
+                    print(f'Finisher variant {variant_name} waiting for active MVSep job '
+                          f'for {original_basename}...')
+                    dependency_log[(variant_name, 'active')] = now
                 return False, 5
 
         try:
-            # Get cut_info and norm_path from item for restoring cut sections on export
-            item_cut_info = item.get('cut_info')
-            item_norm_path = item.get('norm_path')
             build_variant_and_restore(
                 short_basename, original_basename, mask, finisher_dir,
-                variant_name, need_side_restore, base_for_side,
+                variant, need_side_restore, base_for_side,
                 cfg, name_maps,
-                cut_info=item_cut_info, norm_path=item_norm_path)
+                cut_info=item.get('cut_info'), norm_path=item.get('norm_path'),
+                vocals_src_path=vocals_src_path)
             completed.add(variant_name)
         except FileNotFoundError as missing:
             now = time.time()
@@ -630,85 +562,3 @@ def process_finisher_stage(item, mask, mvsep_state, finisher_root,
         return True, None
 
     return False, 5
-
-
-# ---------------------------------------------------------------------------
-# Resume helpers
-# ---------------------------------------------------------------------------
-
-def any_expected_outputs_exist(iterative_folder, basename, iteration_target, name_maps):
-    for model_key in ['mel_v1e', 'bs_resurrect', '2x_mel_v1e', '2x_bs_resurrect']:
-        folder = os.path.join(iterative_folder, model_key)
-        if os.path.exists(folder):
-            found = find_model_output_for_file(folder, basename, '_other', name_maps)
-            if found:
-                return True
-    # check mvsep folders and their 2x counterparts
-    for mv_key in MVSEP_MODEL_INFO.keys():
-        mvsep_folder = get_mvsep_output_dir(iterative_folder, mv_key)
-        if os.path.exists(mvsep_folder) and find_model_output_for_file(
-                mvsep_folder, basename, '_other', name_maps):
-            return True
-        mvsep2_folder = get_mvsep_2x_output_dir(iterative_folder, mv_key)
-        if os.path.exists(mvsep2_folder) and find_model_output_for_file(
-                mvsep2_folder, basename, '_other', name_maps):
-            return True
-    return False
-
-
-def find_highest_processed_pass(basename, mask, cfg, name_maps):
-    """Search from the final iteration down to 1 for any processed outputs.
-    Returns a tuple (found_pass, canonical_input_path or None).
-    - If found_pass == iterations_amount, canonical_input_path will be the final pass_max_fft path.
-    - If found_pass < iterations_amount, canonical_input_path will be the input file to that next pass if available (pass{found_pass+1}_{mask}.wav), otherwise the pass_max_fft path.
-    - If nothing found, returns (0, None).
-    """
-    for p in range(cfg.iterations_amount, 0, -1):
-        eff_mask_p = compute_effective_mask(mask, p, cfg.iterations_amount)
-        folder_p = os.path.join(cfg.ckpt_root, 'iterative', f'pass{p}_{eff_mask_p}')
-        # Canonical pass file for this iteration uses the EFFECTIVE mask for that pass
-        canonical_pass = os.path.join(folder_p, f'{basename}_pass{p}_{eff_mask_p}.wav')
-        if os.path.exists(canonical_pass):
-            return p, canonical_pass
-
-        # No canonical file; check for any model outputs indicating this pass completed
-        model_or_aux_found = None
-        for model_key in ['mel_v1e', 'bs_resurrect', '2x_mel_v1e', '2x_bs_resurrect']:
-            folder = os.path.join(folder_p, model_key)
-            if os.path.exists(folder):
-                found = find_model_output_for_file(folder, basename, '_other', name_maps)
-                if found:
-                    model_or_aux_found = found[0]
-                    break
-        if model_or_aux_found is None:
-            # mvsep variants (base + scnet)
-            for mv_key in MVSEP_MODEL_INFO.keys():
-                mvsep_folder = get_mvsep_output_dir(folder_p, mv_key)
-                if os.path.exists(mvsep_folder):
-                    found = find_model_output_for_file(mvsep_folder, basename, '_other', name_maps)
-                    if found:
-                        model_or_aux_found = found[0]
-                        break
-            if model_or_aux_found is None:
-                for mv_key in MVSEP_MODEL_INFO.keys():
-                    mvsep2_folder = get_mvsep_2x_output_dir(folder_p, mv_key)
-                    if os.path.exists(mvsep2_folder):
-                        found = find_model_output_for_file(mvsep2_folder, basename, '_other', name_maps)
-                        if found:
-                            model_or_aux_found = found[0]
-                            break
-
-        if model_or_aux_found is not None:
-            # We have evidence pass p ran. For resuming into p+1 we want the canonical
-            # NEXT pass input if it already exists (pass{p+1}_{effective_mask(p+1)}.wav).
-            eff_mask_next = (compute_effective_mask(mask, p + 1, cfg.iterations_amount)
-                            if (p + 1) <= cfg.iterations_amount
-                            else compute_effective_mask(mask, p, cfg.iterations_amount))
-            next_folder = os.path.join(cfg.ckpt_root, 'iterative', f'pass{p+1}_{eff_mask_next}')
-            next_input = os.path.join(next_folder, f'{basename}_pass{p+1}_{eff_mask_next}.wav')
-            if os.path.exists(next_input):
-                return p, next_input
-            # Otherwise, if a canonical current pass file (with eff mask) exists use it (already checked) else None.
-            # Fallback to original source (None here) will trigger reconstruction logic later.
-            return p, None
-    return 0, None

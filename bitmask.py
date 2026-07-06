@@ -1,34 +1,44 @@
-from model_data import MASK_BIT_COUNT, AMPLIFY_BIT_MASK, LOWER_BITS_MASK
+from model_data import ITERATIVE_MODEL_KEYS
 
 
-def mask_from_flags(amplify, d2_m1, d2_m2, d2_m3, d2_m4, post_separate_bs_resurrect, post_separate_scnet, side_restore, m1, m2, m3, m4):
-    """Encode flags into a bitmask.
+def _flag_order():
+    """Ordered flag names (most-significant -> least-significant bit).
 
-    Bit order (most-significant -> least-significant):
-        amplify_masked_details,
-        2x_m1, 2x_m2, 2x_m3, 2x_m4,
-        post_separate_bs_resurrect, post_separate_scnet,
-        side_restore,
-        m1, m2, m3, m4
-
-    Extends original scheme with four 2x slowdown bits and two post-separate flags.
+    The amplify bit must stay the most significant bit: compute_effective_mask
+    clears it for non-final passes so intermediate pass folders can be reused
+    regardless of the amplify setting.
     """
-    bits = [
-        int(amplify),
-        int(d2_m1),
-        int(d2_m2),
-        int(d2_m3),
-        int(d2_m4),
-        int(post_separate_bs_resurrect),
-        int(post_separate_scnet),
-        int(side_restore),
-        int(m1),
-        int(m2),
-        int(m3),
-        int(m4),
-    ]
-    s = ''.join(str(b) for b in bits)
-    return int(s, 2)
+    order = ['amplify']
+    order += [f'2x_{k}' for k in ITERATIVE_MODEL_KEYS]
+    order += [f'mid_{k}' for k in ITERATIVE_MODEL_KEYS]
+    order += ['post_bs_resurrect', 'post_scnet', 'side_restore']
+    order += [f'use_{k}' for k in ITERATIVE_MODEL_KEYS]
+    return order
+
+
+MASK_FLAG_ORDER = _flag_order()
+MASK_BIT_COUNT = len(MASK_FLAG_ORDER)
+AMPLIFY_BIT_MASK = 1 << (MASK_BIT_COUNT - 1)
+LOWER_BITS_MASK = AMPLIFY_BIT_MASK - 1
+
+
+def build_mask(cfg):
+    """Encode the run configuration into the folder-naming bitmask."""
+    values = {
+        'amplify': cfg.amplify_masked_details,
+        'post_bs_resurrect': cfg.post_separate_bs_resurrect,
+        'post_scnet': cfg.post_separate_scnet,
+        'side_restore': cfg.restore_side_iterative,
+    }
+    for k in ITERATIVE_MODEL_KEYS:
+        values[f'use_{k}'] = cfg.model_enabled(k)
+        values[f'2x_{k}'] = cfg.slowdown_enabled(k)
+        values[f'mid_{k}'] = cfg.mid_enabled(k)
+
+    mask = 0
+    for name in MASK_FLAG_ORDER:
+        mask = (mask << 1) | int(bool(values.get(name, False)))
+    return mask
 
 
 def compute_effective_mask(mask, iteration_target, iterations_amount):
